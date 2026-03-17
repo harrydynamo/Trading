@@ -1,0 +1,103 @@
+1. MARKET CONDITIONS TO ENTER
+------------------------------
+- Stock price must be above the 200 MA on the weekly chart (trend direction filter)
+- Stock price must be trading within 15% of the 20 MA on the weekly chart (mean-reversion proximity)
+  Note: Previously 5% — loosened because a stock pulling back to a 10-day low can
+  sit 10–15% below its 20 MA while still being in a healthy uptrend.
+- Qualify the setup on the weekly chart first, then look for entry on the daily chart
+
+2. ENTRY TRIGGERS
+-----------------
+Two separate setups:
+
+Setup A — 10-Day Low Pullback:
+  - Stock price pulls back to a 10-day closing low while above the weekly 200 MA
+    Note: Previously 5-day — widened to generate more valid pullback entries.
+  - Volume ranks in the top 20% over the last 12 weeks, sustained for 2 consecutive days
+    Note: Previously 3 consecutive days — reduced because 3-day sustained elevated
+    volume during a pullback is very rare in practice.
+
+Setup B — 7% Drop with Hammer Confirmation:
+  - Stock price drops 7% or more over the last 3 days
+    Note: Previously 10% — lowered because a 10% 3-day drop almost never occurred
+    in backtesting, making Setup B completely inactive.
+  - Wait for a hammer candlestick pattern to form as confirmation before entering
+  - Volume ranks in the top 20% over the last 12 weeks, sustained for 2 consecutive days
+
+Volume Condition (both setups):
+  - Volume must rank in the top 20% relative to the last 12 weeks
+  - Elevated volume sustained for 2 consecutive days (previously 3)
+  - Volume should not exceed the 10-day peak (avoid climax/exhaustion volume)
+
+3. EXIT RULES
+-------------
+Take Profit:
+  - Sell when the stock price reaches a clearly defined resistance level
+    (60-day rolling high, excluding current bar to avoid lookahead)
+  - Only take trades where resistance offers at least a 1.5:1 reward-to-risk ratio
+    vs. the ATR stop loss distance
+    Note: Previously 2:1 — lowered because the 60-day resistance target was
+    frequently unreachable, filtering out too many valid setups.
+
+Trailing Stop:
+  - Once in profit, trail stop at 1.5 ATR below the current price (ratchet up only)
+    Note: Previously 2 ATR — tightened to lock in gains faster.
+  - The trailing stop only activates after holding for at least 10 days
+    (grace period to avoid being stopped out during normal post-entry volatility)
+
+MA Exit:
+  - Exit when price closes below the 20 MA on the daily chart
+  - This exit also only activates after holding for at least 10 days
+    Note: Previously 5 days — extended so the strategy gives trades room to breathe
+    before applying trend-exit rules.
+
+4. STOP LOSS
+------------
+- Hard stop: If the stock price drops 2 ATR from the entry price, exit immediately
+  Note: Previously 3 ATR — tightened so losses are cut faster, keeping avg loss
+  closer to avg win size (improved profit factor from 1.13 → 1.30).
+- This is dynamic and adjusts to current market volatility (ATR period: 14 days)
+
+5. RISK MANAGEMENT
+------------------
+- Maximum 5 open positions at any time
+- Maximum 15% of total capital per position
+- Maximum 75% of capital deployed at once
+- Keep a minimum 25% cash buffer for new opportunities or drawdown protection
+- Minimum reward-to-risk ratio of 1.5:1 before entering any trade (previously 2:1)
+
+6. PARAMETER SUMMARY TABLE
+---------------------------
+Component              | Original          | v1 (first revision)     | v2 (current — backtested)
+-----------------------|-------------------|-------------------------|---------------------------
+Trend Filter           | 200 MA (daily)    | Weekly 200 MA           | Weekly 200 MA (unchanged)
+Proximity Filter       | None              | Within 5% of weekly 20  | Within 15% of weekly 20 MA
+Setup A Lookback       | 5-day low         | 5-day closing low       | 10-day closing low
+Setup B Drop Threshold | 10% in 3 days     | 10% in 3 days           | 7% in 3 days
+Volume Condition       | Top 20%, 3 days   | Top 20%, 3 days         | Top 20%, 2 days
+Hard Stop              | 3 ATR             | 3 ATR                   | 2 ATR
+Trailing Stop          | 2 ATR             | 2 ATR                   | 1.5 ATR
+MA Exit Grace Period   | None              | 5 days                  | 10 days
+Min R:R                | None              | 2:1                     | 1.5:1
+Position Size          | 20% x 5           | 15% x 5, 25% cash       | 15% x 5, 25% cash (unchanged)
+
+7. BACKTEST RESULTS (v2 parameters, 3-year period, 50 mid-cap stocks)
+-----------------------------------------------------------------------
+Period          : March 2023 → March 2026
+Initial Capital : ₹5,00,000
+Final Equity    : ₹5,34,950  (+6.99%)
+CAGR            : +2.29%
+Max Drawdown    : -10.90%
+Total Trades    : 112  (all Setup A; Setup B still needs further tuning)
+Win Rate        : 56.2%
+Avg Win         : ₹2,409
+Avg Loss        : ₹2,383
+Profit Factor   : 1.30
+Avg Hold        : 12.3 days
+
+Notes:
+- Strategy is profitable in mixed bull+bear market (2023–2026)
+- Underperforms passive index (~18% CAGR for Nifty Midcap 150 over same period)
+- Capital preservation strength: only -12.3% max drawdown vs index swings of -25%+
+- Strategy performs best in trending bull markets; bleeds slowly in sustained downtrends
+- Setup B has never fired — volume condition blocks it even on 7% drops; needs separate tuning

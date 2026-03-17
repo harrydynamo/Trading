@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data caches (re-downloaded on demand)
+simulation/data_cache/
+stock_screener/data_cache/
+
+# Generated results (charts, CSVs, Excel)
+simulation/results/
+stock_screener/results/
+
+# Position tracker (personal trade data)
+live_signals/my_positions.json
+
+# Kite Connect access token (regenerated daily)
+access_token.txt
+
+# IDE
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+trading_log.txt
