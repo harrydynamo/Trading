@@ -607,6 +607,137 @@ def scan_tradeable_stocks(include_microcap: bool = False) -> pd.DataFrame:
 
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_sentiment() -> dict:
+    """
+    Fetch key Indian market indices, India VIX, and sector performance.
+    Returns a dict with keys: indices, sectors, vix, breadth.
+    Cached 5 min.
+    """
+    # ── Key indices ───────────────────────────────────────────────────────────
+    INDEX_TICKERS = {
+        "Nifty 50":    "^NSEI",
+        "Sensex":      "^BSESN",
+        "Bank Nifty":  "^NSEBANK",
+        "Nifty IT":    "^CNXIT",
+        "Nifty Midcap 100": "^CNXMIDCAP",
+        "Nifty Smallcap": "^CNXSMALLCAP",
+        "India VIX":   "^INDIAVIX",
+    }
+
+    # ── Sector indices ────────────────────────────────────────────────────────
+    SECTOR_TICKERS = {
+        "IT":       "^CNXIT",
+        "Bank":     "^NSEBANK",
+        "Auto":     "^CNXAUTO",
+        "Pharma":   "^CNXPHARMA",
+        "FMCG":     "^CNXFMCG",
+        "Metal":    "^CNXMETAL",
+        "Energy":   "^CNXENERGY",
+        "Realty":   "^CNXREALTY",
+        "Infra":    "^CNXINFRA",
+        "Media":    "^CNXMEDIA",
+        "Finance":  "^CNXFINANCE",
+        "PSU Bank": "^CNXPSUBANK",
+    }
+
+    def _fetch_quote(ticker: str) -> dict | None:
+        try:
+            df = yf.download(ticker, period="5d", interval="1d",
+                             progress=False, auto_adjust=True)
+            if df is None or len(df) < 2:
+                return None
+            last  = float(df["Close"].iloc[-1])
+            prev  = float(df["Close"].iloc[-2])
+            chg   = last - prev
+            chg_p = chg / prev * 100
+            week_ago = float(df["Close"].iloc[0])
+            week_chg = (last - week_ago) / week_ago * 100
+            return {"last": last, "chg": chg, "chg_pct": chg_p, "week_chg": week_chg}
+        except Exception:
+            return None
+
+    indices = {}
+    for name, tkr in INDEX_TICKERS.items():
+        q = _fetch_quote(tkr)
+        if q:
+            indices[name] = q
+
+    sectors = {}
+    for name, tkr in SECTOR_TICKERS.items():
+        q = _fetch_quote(tkr)
+        if q:
+            sectors[name] = q
+
+    # ── FII / DII flows from NSE (best-effort scrape) ─────────────────────────
+    fii_dii = []
+    try:
+        url  = "https://www.nseindia.com/api/fiidiiTradeReact"
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.nseindia.com/",
+        }
+        import requests as _req
+        # First hit homepage to get cookies
+        s = _req.Session()
+        s.get("https://www.nseindia.com", headers=hdrs, timeout=8)
+        r = s.get(url, headers=hdrs, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            for row in data[:5]:   # last 5 trading days
+                fii_dii.append({
+                    "Date":       row.get("date", ""),
+                    "FII Net (₹Cr)": row.get("fiidiiData", [{}])[0].get("netVal", 0) if row.get("fiidiiData") else 0,
+                    "DII Net (₹Cr)": row.get("fiidiiData", [{}])[1].get("netVal", 0) if len(row.get("fiidiiData", [])) > 1 else 0,
+                })
+    except Exception:
+        pass
+
+    # ── Overall sentiment score ───────────────────────────────────────────────
+    score = 50  # neutral baseline
+    nifty = indices.get("Nifty 50", {})
+    vix   = indices.get("India VIX", {})
+
+    if nifty:
+        if nifty["chg_pct"] > 1:    score += 15
+        elif nifty["chg_pct"] > 0:  score += 7
+        elif nifty["chg_pct"] < -1: score -= 15
+        else:                        score -= 7
+
+        if nifty["week_chg"] > 2:   score += 10
+        elif nifty["week_chg"] < -2: score -= 10
+
+    if vix:
+        if vix["last"] < 15:    score += 10
+        elif vix["last"] < 20:  score += 5
+        elif vix["last"] > 25:  score -= 10
+        elif vix["last"] > 20:  score -= 5
+
+    # Sector breadth — how many sectors are green today
+    green_sectors = sum(1 for v in sectors.values() if v["chg_pct"] > 0)
+    total_sectors = len(sectors) or 1
+    breadth_ratio = green_sectors / total_sectors
+    if breadth_ratio >= 0.7:   score += 10
+    elif breadth_ratio <= 0.3: score -= 10
+
+    score = max(0, min(100, score))
+
+    if score >= 65:   sentiment = "BULLISH"
+    elif score >= 45: sentiment = "NEUTRAL"
+    else:             sentiment = "BEARISH"
+
+    return {
+        "indices":   indices,
+        "sectors":   sectors,
+        "fii_dii":   fii_dii,
+        "score":     score,
+        "sentiment": sentiment,
+        "green_sectors": green_sectors,
+        "total_sectors": total_sectors,
+    }
+
+
 @st.cache_data(ttl=86400, show_spinner="Loading stock universe…")
 def load_universe() -> dict:
     stocks = get_universe()
@@ -1381,7 +1512,7 @@ day_low    = float(df_raw["Low"].iloc[-1])
 is_up = change_pct >= 0
 
 # ─── Top-level tab layout ─────────────────────────────────────────────────────
-tab_chart, tab_scan = st.tabs(["📊  Live Chart", "🎯  Trade Opportunities"])
+tab_chart, tab_scan, tab_sentiment = st.tabs(["📊  Live Chart", "🎯  Trade Opportunities", "🌡️  Market Sentiment"])
 
 with tab_chart:
 
@@ -2168,3 +2299,210 @@ with tab_scan:
                 mime="text/csv",
                 key="dl_scan",
             )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — MARKET SENTIMENT
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_sentiment:
+    st.markdown("### 🌡️ Market Sentiment")
+    st.caption("Live overview of Indian market conditions — indices, VIX, sector breadth, and FII/DII flows.")
+
+    if st.button("🔄 Refresh", key="sentiment_refresh"):
+        st.cache_data.clear()
+
+    with st.spinner("Fetching market data…"):
+        sdata = fetch_market_sentiment()
+
+    sentiment    = sdata["sentiment"]
+    score        = sdata["score"]
+    indices      = sdata["indices"]
+    sectors      = sdata["sectors"]
+    fii_dii      = sdata["fii_dii"]
+    green_sectors = sdata["green_sectors"]
+    total_sectors = sdata["total_sectors"]
+
+    # ── Sentiment gauge ───────────────────────────────────────────────────────
+    if sentiment == "BULLISH":
+        gauge_color = "#1a7a3c"
+        gauge_bg    = "#e8f5ec"
+        gauge_icon  = "🟢"
+    elif sentiment == "BEARISH":
+        gauge_color = "#c0392b"
+        gauge_bg    = "#fdecea"
+        gauge_icon  = "🔴"
+    else:
+        gauge_color = "#b8860b"
+        gauge_bg    = "#fff8e1"
+        gauge_icon  = "🟡"
+
+    st.html(f"""
+    <div style="background:{gauge_bg}; border-left:5px solid {gauge_color};
+                border-radius:8px; padding:16px 20px; margin-bottom:16px;
+                display:flex; align-items:center; gap:20px;">
+      <div style="font-size:2.5rem;">{gauge_icon}</div>
+      <div>
+        <div style="font-size:1.6rem; font-weight:700; color:{gauge_color};">
+          {sentiment} MARKET
+        </div>
+        <div style="font-size:0.9rem; color:#555;">
+          Sentiment score: <strong>{score}/100</strong> ·
+          {green_sectors}/{total_sectors} sectors green today
+        </div>
+      </div>
+    </div>
+    """)
+
+    # ── Key Indices ───────────────────────────────────────────────────────────
+    st.markdown("#### 📈 Key Indices")
+
+    INDEX_ORDER = ["Nifty 50", "Sensex", "Bank Nifty", "Nifty IT",
+                   "Nifty Midcap 100", "Nifty Smallcap", "India VIX"]
+
+    idx_cols = st.columns(len(INDEX_ORDER))
+    for col, name in zip(idx_cols, INDEX_ORDER):
+        q = indices.get(name)
+        if not q:
+            col.metric(name, "—")
+            continue
+        last  = q["last"]
+        chg_p = q["chg_pct"]
+        # Format large numbers
+        if last > 10000:
+            label = f"{last:,.0f}"
+        else:
+            label = f"{last:,.2f}"
+        delta_str = f"{chg_p:+.2f}%"
+        col.metric(name, label, delta_str)
+
+    st.html("<hr style='margin:16px 0; border:none; border-top:1px solid #e0e0e0;'>")
+
+    # ── Sector Heatmap ────────────────────────────────────────────────────────
+    st.markdown("#### 🗂️ Sector Performance")
+
+    if sectors:
+        # Sort by day change
+        sorted_sectors = sorted(sectors.items(), key=lambda x: x[1]["chg_pct"], reverse=True)
+
+        # Build heatmap-style grid (4 per row)
+        cols_per_row = 4
+        rows = [sorted_sectors[i:i+cols_per_row] for i in range(0, len(sorted_sectors), cols_per_row)]
+
+        for row in rows:
+            rcols = st.columns(cols_per_row)
+            for col, (sec_name, q) in zip(rcols, row):
+                chg = q["chg_pct"]
+                wk  = q["week_chg"]
+                if chg >= 1.5:
+                    bg, fg = "#1a7a3c", "white"
+                elif chg >= 0.5:
+                    bg, fg = "#4caf50", "white"
+                elif chg >= 0:
+                    bg, fg = "#c8e6c9", "#1b5e20"
+                elif chg >= -0.5:
+                    bg, fg = "#ffcdd2", "#b71c1c"
+                elif chg >= -1.5:
+                    bg, fg = "#e53935", "white"
+                else:
+                    bg, fg = "#b71c1c", "white"
+
+                col.html(f"""
+                <div style="background:{bg}; color:{fg}; border-radius:8px;
+                            padding:10px 12px; text-align:center; margin:2px;">
+                  <div style="font-weight:700; font-size:0.95rem;">{sec_name}</div>
+                  <div style="font-size:1.1rem; font-weight:700;">{chg:+.2f}%</div>
+                  <div style="font-size:0.75rem; opacity:0.85;">Week: {wk:+.1f}%</div>
+                </div>
+                """)
+    else:
+        st.info("Sector data unavailable.")
+
+    st.html("<hr style='margin:16px 0; border:none; border-top:1px solid #e0e0e0;'>")
+
+    # ── India VIX interpretation ──────────────────────────────────────────────
+    vix_data = indices.get("India VIX")
+    if vix_data:
+        vix_val = vix_data["last"]
+        vix_chg = vix_data["chg_pct"]
+        if vix_val < 15:
+            vix_label, vix_color, vix_msg = "LOW", "#1a7a3c", "Market is calm — good for trend trading"
+        elif vix_val < 20:
+            vix_label, vix_color, vix_msg = "MODERATE", "#b8860b", "Normal volatility — trade with standard stops"
+        elif vix_val < 25:
+            vix_label, vix_color, vix_msg = "ELEVATED", "#e65100", "Higher volatility — use wider stops, smaller size"
+        else:
+            vix_label, vix_color, vix_msg = "HIGH", "#c0392b", "Fear in market — avoid aggressive entries"
+
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            st.metric("India VIX", f"{vix_val:.2f}", f"{vix_chg:+.2f}%")
+        with c2:
+            st.html(f"""
+            <div style="background:#f8f9fa; border-left:4px solid {vix_color};
+                        border-radius:6px; padding:12px 16px; margin-top:4px;">
+              <span style="color:{vix_color}; font-weight:700;">VIX {vix_label}</span>
+              <span style="color:#555; margin-left:8px;">{vix_msg}</span>
+            </div>
+            """)
+
+    # ── FII / DII Flows ───────────────────────────────────────────────────────
+    if fii_dii:
+        st.markdown("#### 💰 FII / DII Activity (Last 5 Days)")
+        df_fii = pd.DataFrame(fii_dii)
+
+        def _fii_style(df):
+            def fii_col(val):
+                if not isinstance(val, (int, float)): return ""
+                return "color:#1a7a3c; font-weight:600" if val > 0 else "color:#c0392b; font-weight:600"
+            return (df.style
+                    .applymap(fii_col, subset=["FII Net (₹Cr)", "DII Net (₹Cr)"])
+                    .format({"FII Net (₹Cr)": "{:+,.0f}", "DII Net (₹Cr)": "{:+,.0f}"}))
+
+        st.dataframe(_fii_style(df_fii), hide_index=True, use_container_width=True)
+    else:
+        st.caption("FII/DII flow data unavailable (NSE API may be rate-limited). Try refreshing.")
+
+    # ── Nifty 50 mini chart ───────────────────────────────────────────────────
+    st.html("<hr style='margin:16px 0; border:none; border-top:1px solid #e0e0e0;'>")
+    st.markdown("#### 📉 Nifty 50 — 3 Month Chart")
+
+    try:
+        nifty_df = yf.download("^NSEI", period="3mo", interval="1d",
+                                progress=False, auto_adjust=True)
+        if nifty_df is not None and len(nifty_df) > 5:
+            nifty_df.index = pd.to_datetime(nifty_df.index)
+            fig_n = go.Figure()
+            colors = ["#c0392b" if float(nifty_df["Close"].iloc[i]) < float(nifty_df["Open"].iloc[i])
+                      else "#1a7a3c" for i in range(len(nifty_df))]
+            fig_n.add_trace(go.Candlestick(
+                x=nifty_df.index,
+                open=nifty_df["Open"].squeeze(),
+                high=nifty_df["High"].squeeze(),
+                low=nifty_df["Low"].squeeze(),
+                close=nifty_df["Close"].squeeze(),
+                name="Nifty 50",
+                increasing_line_color="#1a7a3c",
+                decreasing_line_color="#c0392b",
+            ))
+            # EMA 20
+            ema20 = nifty_df["Close"].squeeze().ewm(span=20, adjust=False).mean()
+            fig_n.add_trace(go.Scatter(
+                x=nifty_df.index, y=ema20,
+                line=dict(color="#1a5aad", width=1.5),
+                name="EMA 20",
+            ))
+            fig_n.update_layout(
+                height=320,
+                margin=dict(l=0, r=0, t=0, b=0),
+                paper_bgcolor="white",
+                plot_bgcolor="#fafafa",
+                xaxis=dict(type="date", showgrid=False, rangeslider_visible=False,
+                           rangebreaks=[dict(bounds=["sat", "mon"])]),
+                yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
+                legend=dict(orientation="h", y=1.02, x=0),
+                showlegend=True,
+            )
+            st.plotly_chart(fig_n, use_container_width=True, config={"displayModeBar": False})
+    except Exception:
+        st.info("Nifty chart unavailable.")

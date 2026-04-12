@@ -67,11 +67,20 @@ def _streamlit_cmd(script: str, port: int) -> list[str]:
     ]
 
 
-def _open_browser(port: int, delay: float = 3.0):
-    """Wait for server to start, then open browser."""
+def _open_browser(port: int, delay: float = 6.0):
+    """Poll until the server responds, then open browser (max 60s)."""
+    import urllib.request
     def _wait_and_open():
-        time.sleep(delay)
-        webbrowser.open(f"http://localhost:{port}")
+        url = f"http://localhost:{port}"
+        deadline = time.time() + 60
+        time.sleep(delay)   # initial grace period
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(url, timeout=1)
+                break          # server is up
+            except Exception:
+                time.sleep(1)
+        webbrowser.open(url)
     threading.Thread(target=_wait_and_open, daemon=True).start()
 
 
@@ -95,7 +104,7 @@ def launch(name: str, btn: tk.Button, status_var: tk.StringVar):
         _procs[name] = proc
         _open_browser(app["port"])
         btn.config(text="🟢  Open in Browser", bg="#1a7a3c", fg="white")
-        status_var.set(f"Started on http://localhost:{app['port']}")
+        status_var.set(f"Starting… browser will open at http://localhost:{app['port']}")
 
     elif app["mode"] == "terminal":
         # Open a new terminal window
