@@ -66,6 +66,17 @@ def _score_color(score: float, max_score: float) -> str:
     return "red"
 
 
+def _fmt(v, fmt=".1f", suffix="", na="—"):
+    """Format a float, returning na string if NaN."""
+    try:
+        import math
+        if v is None or math.isnan(float(v)):
+            return na
+        return f"{float(v):{fmt}}{suffix}"
+    except (TypeError, ValueError):
+        return na
+
+
 def print_results(scores: list[ScoreBreakdown], top_n: int = 30):
     valid = [s for s in scores if not s.error]
     valid.sort(key=lambda s: s.total, reverse=True)
@@ -74,56 +85,68 @@ def print_results(scores: list[ScoreBreakdown], top_n: int = 30):
     timestamp = datetime.now().strftime("%d %b %Y  %H:%M")
     console.print()
     console.print(Panel(
-        f"  [bold white]NSE / BSE STOCK SCREENER[/bold white]   "
+        f"  [bold white]NSE / BSE STOCK SCREENER — FUNDAMENTAL ANALYSIS[/bold white]   "
         f"[dim]{len(valid)} stocks scored  |  {timestamp}[/dim]",
         border_style="blue", box=box.DOUBLE_EDGE,
     ))
     console.print()
 
     t = Table(
-        title=f"Top {len(show)} Stocks by Score",
+        title=f"Top {len(show)} Stocks by Fundamental Score",
         box=box.SIMPLE_HEAVY, border_style="blue",
         title_style="bold white", show_lines=False,
     )
 
-    t.add_column("Rank",     justify="right",  min_width=5)
-    t.add_column("Symbol",   style="bold cyan", min_width=12)
-    t.add_column("Name",                        min_width=26)
-    t.add_column("Exch/Cap", justify="center",  min_width=10)
-    t.add_column("Price ₹",  justify="right",   min_width=10)
-    t.add_column("Score",    justify="center",  min_width=8)
-    t.add_column("Grade",    justify="center",  min_width=6)
-    t.add_column("Signal",   justify="center",  min_width=12)
-    t.add_column("Trend",    justify="center",  min_width=7)
-    t.add_column("Momntm",   justify="center",  min_width=7)
-    t.add_column("Volume",   justify="center",  min_width=7)
-    t.add_column("Strength", justify="center",  min_width=8)
-    t.add_column("Setup",    justify="center",  min_width=6)
+    t.add_column("Rank",      justify="right",  min_width=4)
+    t.add_column("Symbol",    style="bold cyan", min_width=12)
+    t.add_column("Name",                         min_width=22)
+    t.add_column("Exch/Cap",  justify="center",  min_width=9)
+    t.add_column("Price ₹",   justify="right",   min_width=9)
+    t.add_column("Score",     justify="center",  min_width=8)
+    t.add_column("Grade",     justify="center",  min_width=5)
+    t.add_column("Signal",    justify="center",  min_width=11)
+    t.add_column("PE",        justify="right",   min_width=6)
+    t.add_column("PS",        justify="right",   min_width=6)
+    t.add_column("ROCE%",     justify="right",   min_width=7)
+    t.add_column("OPM%",      justify="right",   min_width=6)
+    t.add_column("NPM%",      justify="right",   min_width=6)
+    t.add_column("FCF%",      justify="right",   min_width=6)
+    t.add_column("Sales Gr%", justify="right",   min_width=8)
+    t.add_column("CCC days",  justify="right",   min_width=8)
+    t.add_column("ROE%",      justify="right",   min_width=6)
+    t.add_column("EPS ₹",     justify="right",   min_width=7)
+    t.add_column("Promo%",    justify="right",   min_width=7)
 
     for rank, s in enumerate(show, 1):
         cap_label = f"{s.exchange}/{s.cap[:3].upper()}"
         sig_style = _signal_style(s.signal)
         tot_color = _score_color(s.total, 100)
+        ind       = s.indicators
 
         t.add_row(
             str(rank),
             s.symbol,
-            s.name[:25],
+            s.name[:21],
             f"[dim]{cap_label}[/dim]",
-            f"₹{s.price:,.2f}",
+            f"₹{s.price:,.0f}" if s.price else "—",
             f"[{tot_color}]{s.total:.0f}/100[/{tot_color}]",
             f"[{tot_color}]{s.grade}[/{tot_color}]",
             f"[{sig_style}]{s.signal}[/{sig_style}]",
-            f"[{_score_color(s.trend,    30)}]{s.trend:.0f}/30[/{_score_color(s.trend,    30)}]",
-            f"[{_score_color(s.momentum, 25)}]{s.momentum:.0f}/25[/{_score_color(s.momentum, 25)}]",
-            f"[{_score_color(s.volume,   20)}]{s.volume:.0f}/20[/{_score_color(s.volume,   20)}]",
-            f"[{_score_color(s.strength, 15)}]{s.strength:.0f}/15[/{_score_color(s.strength, 15)}]",
-            f"[{_score_color(s.setup,    10)}]{s.setup:.0f}/10[/{_score_color(s.setup,    10)}]",
+            _fmt(ind.get("pe_ratio"),              ".1f"),
+            _fmt(ind.get("ps_ratio"),              ".1f"),
+            _fmt(ind.get("roce"),                  ".1f", "%"),
+            _fmt(ind.get("operating_margin"),      ".1f", "%"),
+            _fmt(ind.get("net_profit_margin"),     ".1f", "%"),
+            _fmt(ind.get("fcf_margin"),            ".1f", "%"),
+            _fmt(ind.get("sales_growth"),          ".1f", "%"),
+            _fmt(ind.get("ccc"),                   ".0f", "d"),
+            _fmt(ind.get("roe"),                   ".1f", "%"),
+            _fmt(ind.get("net_eps"),               ".1f", ""),
+            _fmt(ind.get("promoter_holding"),      ".1f", "%"),
         )
 
     console.print(t)
 
-    # Print scoring legend
     console.print(
         "  Score guide: "
         "[bold green]80–100 = A+ Strong Buy[/bold green]  "
@@ -132,40 +155,66 @@ def print_results(scores: list[ScoreBreakdown], top_n: int = 30):
         "[red]< 50 = Avoid[/red]"
     )
     console.print()
+    console.print(
+        "  [dim]Promoter% = heldPercentInsiders proxy (approximate). "
+        "Not available via free APIs: Change in Promoter Holding, Promoter Buying, "
+        "Order Book, Segmental Revenue, Sales Breakup.[/dim]"
+    )
+    console.print()
 
 
 # ─── CSV export ───────────────────────────────────────────────────────────────
+
+def _rnd(v, n=2):
+    try:
+        import math
+        return round(float(v), n) if not math.isnan(float(v)) else None
+    except (TypeError, ValueError):
+        return None
+
 
 def save_csv(scores: list[ScoreBreakdown], output_dir: str):
     rows = []
     for s in sorted(scores, key=lambda x: x.total, reverse=True):
         ind = s.indicators
         rows.append({
-            "Symbol":        s.symbol,
-            "Name":          s.name,
-            "Exchange":      s.exchange,
-            "Cap":           s.cap,
-            "Price (₹)":     round(s.price, 2),
-            "Total Score":   round(s.total, 1),
-            "Grade":         s.grade,
-            "Signal":        s.signal,
-            "Trend /30":     round(s.trend, 1),
-            "Momentum /25":  round(s.momentum, 1),
-            "Volume /20":    round(s.volume, 1),
-            "Strength /15":  round(s.strength, 1),
-            "Setup /10":     round(s.setup, 1),
-            "RSI":           round(ind.get("rsi", np.nan), 1),
-            "MACD Hist":     round(ind.get("macd_hist", np.nan), 3),
-            "ATR%":          round(ind.get("atr_pct", np.nan), 2),
-            "Vol Ratio":     round(ind.get("vol_ratio", np.nan), 2),
-            "BB Position%":  round(ind.get("bb_pos", np.nan), 1),
-            "ROC 1M%":       round(ind.get("roc1m", np.nan), 2),
-            "ROC 3M%":       round(ind.get("roc3m", np.nan), 2),
-            "ROC 6M%":       round(ind.get("roc6m", np.nan), 2),
-            "% from 52W High": round(ind.get("pct_from_52h", np.nan), 2),
-            "Above W200 MA": int(ind.get("above_w200", 0)),
-            "Golden Cross":  int(ind.get("golden_cross", 0)),
-            "Error":         s.error,
+            "Symbol":              s.symbol,
+            "Name":                s.name,
+            "Exchange":            s.exchange,
+            "Cap":                 s.cap,
+            "Price (₹)":           _rnd(s.price, 2),
+            "Total Score":         _rnd(s.total, 1),
+            "Grade":               s.grade,
+            "Signal":              s.signal,
+            # Score categories
+            "Valuation /20":       _rnd(s.valuation, 1),
+            "Profitability /25":   _rnd(s.profitability, 1),
+            "Growth /20":          _rnd(s.growth, 1),
+            "Efficiency /20":      _rnd(s.efficiency, 1),
+            "Quality /15":         _rnd(s.quality, 1),
+            # Raw fundamental ratios
+            "P/E Ratio":                  _rnd(ind.get("pe_ratio"), 1),
+            "Market Cap/Sales":           _rnd(ind.get("ps_ratio"), 2),
+            "ROCE %":                     _rnd(ind.get("roce"), 1),
+            "Operating Margin %":         _rnd(ind.get("operating_margin"), 1),
+            "Net Profit Margin %":        _rnd(ind.get("net_profit_margin"), 1),
+            "FCF Margin %":               _rnd(ind.get("fcf_margin"), 1),
+            "Free Cash Flow (₹)":         _rnd(ind.get("fcf"), 0),
+            "Net EPS (₹)":                _rnd(ind.get("net_eps"), 2),
+            "Sales Growth % YoY":         _rnd(ind.get("sales_growth"), 1),
+            "Capex/Sales %":              _rnd(ind.get("capex_sales"), 1),
+            "Receivable/Sales %":         _rnd(ind.get("receivable_sales"), 1),
+            "Receivable Days":            _rnd(ind.get("receivable_days"), 0),
+            "Cash Conv. Cycle":           _rnd(ind.get("ccc"), 0),
+            "ROE %":                      _rnd(ind.get("roe"), 1),
+            "Promoter Holding % (proxy)": _rnd(ind.get("promoter_holding"), 1),
+            # Not available via free APIs
+            "Change in Promoter Holding": None,
+            "Promoter Buying":            None,
+            "Order Book":                 None,
+            "Segmental Revenue":          None,
+            "Sales Breakup":              None,
+            "Error":                      s.error,
         })
     df = pd.DataFrame(rows)
     path = os.path.join(output_dir, "scores.csv")
@@ -274,11 +323,13 @@ def save_heatmap(scores: list[ScoreBreakdown], output_dir: str, top_n: int = 40)
     show  = valid[:top_n]
 
     data = np.array([
-        [s.trend / 30, s.momentum / 25, s.volume / 20, s.strength / 15, s.setup / 10]
+        [s.valuation / 20, s.profitability / 25, s.growth / 20,
+         s.efficiency / 20, s.quality / 15]
         for s in show
     ])
     labels_y = [s.symbol for s in show]
-    labels_x = ["Trend\n/30", "Momentum\n/25", "Volume\n/20", "Strength\n/15", "Setup\n/10"]
+    labels_x = ["Valuation\n/20", "Profitability\n/25", "Growth\n/20",
+                 "Efficiency\n/20", "Quality\n/15"]
 
     fig, ax = plt.subplots(figsize=(10, max(8, top_n * 0.35)))
     im = ax.imshow(data, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1)
@@ -290,8 +341,9 @@ def save_heatmap(scores: list[ScoreBreakdown], output_dir: str, top_n: int = 40)
 
     for i in range(len(show)):
         for j, (val, max_v) in enumerate(zip(
-            [show[i].trend, show[i].momentum, show[i].volume, show[i].strength, show[i].setup],
-            [30, 25, 20, 15, 10]
+            [show[i].valuation, show[i].profitability, show[i].growth,
+             show[i].efficiency, show[i].quality],
+            [20, 25, 20, 20, 15]
         )):
             ax.text(j, i, f"{val:.0f}", ha="center", va="center",
                     fontsize=7, color="black" if 0.3 < data[i,j] < 0.8 else "white")

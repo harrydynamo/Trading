@@ -1,198 +1,471 @@
 """
-Technical indicator calculations for the stock screener.
-All functions operate on a pandas DataFrame with OHLCV columns.
-Returns scalar values (latest bar) used by the scorer.
+Fundamental indicator calculations for the stock screener.
+
+All ratios use TTM (Trailing Twelve Months) — sum of last 4 quarterly filings
+for P&L and cash flow items; latest quarter for balance sheet items.
+This matches screener.in's methodology.
+
+Formulas aligned to screener.in:
+  P/E           = Market Cap / TTM Net Profit
+  P/S           = Market Cap / TTM Revenue
+  ROCE          = EBIT(TTM) / (Total Assets − Current Liabilities) × 100
+  Operating Margin = EBITDA(TTM) / Revenue(TTM) × 100   [EBIT + Depreciation]
+  Net Profit Margin = Net Income(TTM) / Revenue(TTM) × 100
+  ROE           = Net Income(TTM) / Shareholders' Equity × 100
+  FCF Margin    = (Operating CF − Capex)(TTM) / Revenue(TTM) × 100
+  Sales Growth  = (TTM Revenue − Prior Year Revenue) / |Prior Year| × 100
+  Receivable Days = Receivables / Revenue(TTM) × 365
+  Inventory Days  = Inventory / COGS(TTM) × 365
+  Payable Days    = Payables / COGS(TTM) × 365
+  CCC           = Receivable Days + Inventory Days − Payable Days
+  Capex/Sales   = |Capex(TTM)| / Revenue(TTM) × 100
+  Receivable/Sales = Receivables / Revenue(TTM) × 100
+
+Not available via any free public API:
+  Promoter Holding — heldPercentInsiders is used as a proxy but is unreliable
+  Change in Promoter Holding — requires BSE quarterly shareholding pattern scraping
+  Promoter buying, Order book, Segmental revenue, Sales breakup
 """
 
+import logging
+import re
 import numpy as np
 import pandas as pd
+import requests
+import yfinance as yf
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+# ─── Shared requests session for screener.in ──────────────────────────────────
+_SCREENER_SESSION: requests.Session | None = None
+_SCREENER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
-# ─── Moving averages ──────────────────────────────────────────────────────────
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).mean()
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-# ─── RSI ─────────────────────────────────────────────────────────────────────
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+def _screener_session() -> requests.Session:
+    global _SCREENER_SESSION
+    if _SCREENER_SESSION is None:
+        _SCREENER_SESSION = requests.Session()
+        _SCREENER_SESSION.headers.update(_SCREENER_HEADERS)
+    return _SCREENER_SESSION
 
 
-# ─── MACD ────────────────────────────────────────────────────────────────────
-
-def macd(series: pd.Series,
-         fast: int = 12, slow: int = 26, signal: int = 9
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Returns (macd_line, signal_line, histogram)."""
-    fast_ema   = ema(series, fast)
-    slow_ema   = ema(series, slow)
-    macd_line  = fast_ema - slow_ema
-    signal_line= ema(macd_line, signal)
-    histogram  = macd_line - signal_line
-    return macd_line, signal_line, histogram
+_HOLDING_CATEGORY_KEYWORDS = re.compile(
+    r"^(FII|DII|Public|Institutions|Others|Mutual Fund|Insurance|Government|Foreign)",
+    re.IGNORECASE,
+)
 
 
-# ─── ATR ─────────────────────────────────────────────────────────────────────
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    prev_c = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_c).abs(),
-        (df["Low"]  - prev_c).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-# ─── Bollinger Bands ─────────────────────────────────────────────────────────
-
-def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Returns (upper, middle, lower)."""
-    mid   = sma(series, period)
-    std   = series.rolling(period).std()
-    return mid + std_dev * std, mid, mid - std_dev * std
-
-
-# ─── OBV (On-Balance Volume) ─────────────────────────────────────────────────
-
-def obv(df: pd.DataFrame) -> pd.Series:
-    direction = np.sign(df["Close"].diff())
-    return (direction * df["Volume"]).fillna(0).cumsum()
-
-
-# ─── Weekly MA helper ─────────────────────────────────────────────────────────
-
-def weekly_sma(daily_df: pd.DataFrame, period: int) -> pd.Series:
+def fetch_promoter_holding_screener(
+    yf_ticker: str,
+) -> tuple[float, float, str, float]:
     """
-    Resample to weekly, compute SMA, then forward-fill back to daily.
-    Uses shift(1) so each day sees the previous completed week's value.
+    Scrape promoter holding from screener.in.
+    Tries consolidated page first, then standalone.
+
+    Returns
+    -------
+    (total_pct, change_vs_prev_quarter_pct, top_promoter_name, top_promoter_pct)
+    NaN / "" where unavailable.
     """
-    weekly = daily_df["Close"].resample("W-FRI").last()
-    w_sma  = weekly.rolling(period).mean().shift(1)
-    return w_sma.reindex(daily_df.index, method="ffill")
+    clean = re.sub(r"\.(NS|BO)$", "", yf_ticker.upper().strip())
+    if not clean:
+        return np.nan, np.nan, "", np.nan
+
+    session = _screener_session()
+
+    for suffix in ("/consolidated/", "/"):
+        url = f"https://www.screener.in/company/{clean}{suffix}"
+        try:
+            resp = session.get(url, timeout=8)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = soup.find_all("tr")
+
+            total_pct   = np.nan
+            change_pct  = np.nan
+            found_total = False
+
+            # Individual promoter sub-rows collected after the Promoters total row
+            individuals: list[tuple[str, float]] = []
+
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) < 2:
+                    continue
+                label = cells[0].get_text(strip=True)
+
+                if not found_total:
+                    # Look for the main "Promoters" total row
+                    if not re.match(r"^Promoters$", label, re.IGNORECASE):
+                        continue
+                    values: list[float] = []
+                    for cell in cells[1:]:
+                        m = re.search(r"([\d.]+)", cell.get_text(strip=True))
+                        if m:
+                            values.append(float(m.group(1)))
+                    if not values:
+                        break
+                    total_pct  = values[0]
+                    change_pct = round(total_pct - values[1], 2) if len(values) >= 2 else np.nan
+                    found_total = True
+
+                else:
+                    # Rows after the Promoters total — stop at next main category
+                    if _HOLDING_CATEGORY_KEYWORDS.match(label):
+                        break
+                    # Skip rows that look like totals again
+                    if re.match(r"^Promoters$", label, re.IGNORECASE):
+                        break
+                    # Collect individual promoter rows (non-empty label, has a number)
+                    if label:
+                        m = re.search(r"([\d.]+)", cells[1].get_text(strip=True))
+                        if m:
+                            individuals.append((label, float(m.group(1))))
+
+            if not np.isnan(total_pct):
+                # Pick the individual with the highest holding
+                if individuals:
+                    top_name, top_pct = max(individuals, key=lambda x: x[1])
+                else:
+                    top_name, top_pct = "", np.nan
+                return total_pct, change_pct, top_name, top_pct
+
+        except Exception:
+            continue
+
+    return np.nan, np.nan, "", np.nan
 
 
-# ─── Rate of change ──────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def roc(series: pd.Series, period: int) -> pd.Series:
-    """Percentage rate of change over `period` bars."""
-    return (series - series.shift(period)) / series.shift(period) * 100
+def _val(df: pd.DataFrame, *keys, col: int = 0) -> float:
+    """Extract a scalar from an annual financial statement DataFrame."""
+    if df is None or df.empty:
+        return np.nan
+    for key in keys:
+        try:
+            if key in df.index:
+                v = df.loc[key].iloc[col]
+                if pd.notna(v):
+                    return float(v)
+        except Exception:
+            continue
+    return np.nan
 
 
-# ─── 52-week high/low ────────────────────────────────────────────────────────
-
-def high_52w(df: pd.DataFrame) -> float:
-    return float(df["High"].rolling(252).max().iloc[-1])
-
-def low_52w(df: pd.DataFrame) -> float:
-    return float(df["Low"].rolling(252).min().iloc[-1])
-
-
-# ─── Compute all indicators, return flat dict of latest values ────────────────
-
-def compute_all(df: pd.DataFrame) -> dict:
+def _ttm(qdf: pd.DataFrame, adf: pd.DataFrame, *keys) -> float:
     """
-    Compute every indicator needed by the scorer and return
-    a flat dict of scalar values (all from the latest bar).
+    Return TTM (sum of last 4 quarters) for P&L / cash flow items.
+    Falls back to most recent annual figure if quarterly data is sparse.
+    If fewer than 4 quarters exist, annualises proportionally (×4/n).
     """
-    if len(df) < 60:
-        return {}
+    if qdf is not None and not qdf.empty:
+        for key in keys:
+            if key in qdf.index:
+                series = qdf.loc[key]
+                vals   = series.iloc[:4]          # newest → oldest
+                n_valid = vals.notna().sum()
+                if n_valid >= 2:
+                    total = float(vals.fillna(0).sum())
+                    if n_valid < 4:
+                        total = total * 4 / n_valid   # annualise partial year
+                    return total
+    # Fallback: annual col 0
+    return _val(adf, *keys, col=0)
 
-    close  = df["Close"]
-    volume = df["Volume"]
 
-    # SMAs
-    sma20  = sma(close, 20)
-    sma50  = sma(close, 50)
-    sma200 = sma(close, 200)
+def _latest(qdf: pd.DataFrame, adf: pd.DataFrame, *keys) -> float:
+    """Return the most recent value from quarterly balance sheet, fallback annual."""
+    if qdf is not None and not qdf.empty:
+        for key in keys:
+            if key in qdf.index:
+                v = qdf.loc[key].iloc[0]
+                if pd.notna(v):
+                    return float(v)
+    return _val(adf, *keys, col=0)
 
-    # Weekly 200 & 20 SMAs (need enough history)
-    w_sma200 = weekly_sma(df, 200) if len(df) >= 1000 else pd.Series(np.nan, index=df.index)
-    w_sma20  = weekly_sma(df, 20)
 
-    # RSI
-    rsi14 = rsi(close, 14)
+# ─── Main computation ─────────────────────────────────────────────────────────
 
-    # MACD
-    macd_line, signal_line, histogram = macd(close)
+def compute_fundamentals(ticker_obj: yf.Ticker, info: dict,
+                         yf_ticker: str = "") -> dict:
+    """
+    Compute all fundamental ratios for a single stock using TTM methodology.
+    Returns a flat dict of scalar values (NaN where data is unavailable).
+    """
+    # ── Fetch all statement DataFrames ────────────────────────────────────────
+    try:
+        fin_a = ticker_obj.financials               # annual income statement
+    except Exception:
+        fin_a = pd.DataFrame()
+    try:
+        fin_q = ticker_obj.quarterly_financials     # quarterly income statement
+    except Exception:
+        fin_q = pd.DataFrame()
 
-    # ATR
-    atr14  = atr(df, 14)
-    atr_pct = atr14 / close * 100          # ATR as % of price (volatility %)
+    try:
+        bs_a = ticker_obj.balance_sheet             # annual balance sheet
+    except Exception:
+        bs_a = pd.DataFrame()
+    try:
+        bs_q = ticker_obj.quarterly_balance_sheet   # quarterly balance sheet
+    except Exception:
+        bs_q = pd.DataFrame()
 
-    # Bollinger Bands
-    bb_upper, bb_mid, bb_lower = bollinger_bands(close, 20)
-    bb_width  = (bb_upper - bb_lower) / bb_mid * 100   # band width %
-    bb_pos    = (close - bb_lower) / (bb_upper - bb_lower) * 100  # 0=at lower, 100=at upper
+    try:
+        cf_a = ticker_obj.cashflow                  # annual cash flow
+    except Exception:
+        cf_a = pd.DataFrame()
+    try:
+        cf_q = ticker_obj.quarterly_cashflow        # quarterly cash flow
+    except Exception:
+        cf_q = pd.DataFrame()
 
-    # OBV
-    obv_series  = obv(df)
-    obv_sma20   = sma(obv_series, 20)
+    # ── Market data from info dict ────────────────────────────────────────────
+    price      = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
+    market_cap = float(info.get("marketCap") or np.nan)
+    shares     = float(info.get("sharesOutstanding") or np.nan)
+    sector     = str(info.get("sector")   or "Unknown")
+    industry   = str(info.get("industry") or "Unknown")
 
-    # Volume averages
-    vol_sma5    = sma(volume, 5)
-    vol_sma20   = sma(volume, 20)
-    vol_ratio   = volume / vol_sma20       # today's vol vs 20-day avg
+    # Detect currency mismatch: price/mktcap are in INR but some companies
+    # (e.g. INFY, WIPRO) report financials in USD via yfinance.
+    # When there's a mismatch all ratio calculations that divide mktcap by a
+    # financial statement figure will be wrong — fall back to yfinance pre-computed.
+    price_currency   = str(info.get("currency") or "INR").upper()
+    fin_currency     = str(info.get("financialCurrency") or price_currency).upper()
+    currency_mismatch = (price_currency != fin_currency)
 
-    # 52-week levels
-    h52 = close.rolling(252).max()
-    l52 = close.rolling(252).min()
-    pct_from_52h = (close - h52) / h52 * 100   # negative = below 52w high
-    pct_from_52l = (close - l52) / l52 * 100   # positive = above 52w low
+    # ── TTM Revenue ───────────────────────────────────────────────────────────
+    revenue_ttm = _ttm(fin_q, fin_a, "Total Revenue", "Revenue")
 
-    # Rate of change
-    roc1m  = roc(close, 21)    # ~1 month
-    roc3m  = roc(close, 63)    # ~3 months
-    roc6m  = roc(close, 126)   # ~6 months
+    # Prior-year annual revenue for sales growth (use annual col 1)
+    revenue_prior = _val(fin_a, "Total Revenue", "Revenue", col=1)
+    # Fallback: 5 quarters ago vs 1 quarter ago from quarterly data
+    if np.isnan(revenue_prior) and fin_q is not None and not fin_q.empty:
+        for key in ("Total Revenue", "Revenue"):
+            if key in fin_q.index:
+                series = fin_q.loc[key]
+                if len(series) >= 8:
+                    # sum quarters 4–7 (one year ago TTM)
+                    old = float(series.iloc[4:8].fillna(0).sum())
+                    if old > 0:
+                        revenue_prior = old
+                        break
 
-    # Golden / Death cross (daily 50 vs 200)
-    golden_cross = (sma50 > sma200).astype(int)
+    # ── TTM Income Statement items ────────────────────────────────────────────
+    ebit_ttm = _ttm(fin_q, fin_a,
+                    "EBIT", "Operating Income", "Ebit",
+                    "Normalized EBITDA")        # last resort
 
-    def _last(s: pd.Series) -> float:
-        v = s.iloc[-1]
-        return float(v) if not (isinstance(v, float) and np.isnan(v)) else np.nan
+    net_income_ttm = _ttm(fin_q, fin_a,
+                          "Net Income",
+                          "Net Income From Continuing Operations",
+                          "Net Income Common Stockholders")
+
+    cogs_ttm = _ttm(fin_q, fin_a,
+                    "Cost Of Revenue",
+                    "Cost of Goods and Services Sold",
+                    "Reconciled Cost Of Revenue",
+                    "Cost Of Goods Sold")
+
+    # ── TTM Cash Flow items ───────────────────────────────────────────────────
+    depreciation_ttm = _ttm(cf_q, cf_a,
+                             "Depreciation And Amortization",
+                             "Depreciation Amortization Depletion",
+                             "Depreciation",
+                             "Amortization Of Intangibles Assets")
+
+    op_cf_ttm = _ttm(cf_q, cf_a,
+                     "Operating Cash Flow",
+                     "Total Cash From Operating Activities",
+                     "Cash Flows From Operating Activities")
+
+    capex_ttm = _ttm(cf_q, cf_a,
+                     "Capital Expenditure",
+                     "Capital Expenditures",
+                     "Purchase Of Property Plant And Equipment",
+                     "Purchases Of Property Plant And Equipment")
+
+    # ── Balance Sheet (latest quarter or annual) ──────────────────────────────
+    total_assets   = _latest(bs_q, bs_a, "Total Assets")
+    current_liab   = _latest(bs_q, bs_a,
+                             "Current Liabilities",
+                             "Total Current Liabilities Net Minority Interest")
+    total_equity   = _latest(bs_q, bs_a,
+                             "Stockholders Equity",
+                             "Total Stockholder Equity",
+                             "Total Equity Gross Minority Interest")
+    receivables    = _latest(bs_q, bs_a,
+                             "Net Receivables", "Receivables", "Accounts Receivable")
+    inventory      = _latest(bs_q, bs_a, "Inventory", "Inventories")
+    payables       = _latest(bs_q, bs_a,
+                             "Accounts Payable", "Payables And Accrued Expenses")
+
+    # ── P/E — Market Cap / TTM Net Profit ─────────────────────────────────────
+    raw_pe = float(info.get("trailingPE") or np.nan)
+    if currency_mismatch:
+        # financials in foreign currency — use yfinance pre-computed (currency-aware)
+        pe_ratio = raw_pe if (not np.isnan(raw_pe) and 0 < raw_pe < 5000) else np.nan
+    elif (not np.isnan(market_cap) and not np.isnan(net_income_ttm)
+            and net_income_ttm > 0):
+        pe_ratio = market_cap / net_income_ttm
+    else:
+        pe_ratio = raw_pe if (not np.isnan(raw_pe) and 0 < raw_pe < 5000) else np.nan
+
+    # ── P/S — Market Cap / TTM Revenue ────────────────────────────────────────
+    if (not currency_mismatch and not np.isnan(market_cap)
+            and not np.isnan(revenue_ttm) and revenue_ttm > 0):
+        ps_ratio = market_cap / revenue_ttm
+    else:
+        ps_ratio = float(info.get("priceToSalesTrailing12Months") or np.nan)
+
+    # ── Sales Growth (YoY) ────────────────────────────────────────────────────
+    if (not np.isnan(revenue_ttm) and not np.isnan(revenue_prior)
+            and revenue_prior != 0):
+        sales_growth = (revenue_ttm - revenue_prior) / abs(revenue_prior) * 100
+    else:
+        sales_growth = np.nan
+
+    # ── ROCE = EBIT(TTM) / Capital Employed  (CE = Total Assets − Curr Liab) ─
+    # ROCE is not meaningful for banks/NBFCs/insurance — their "current liabilities"
+    # include customer deposits which inflates CE and distorts the ratio.
+    _is_financial = "financial" in sector.lower()
+    capital_employed = np.nan
+    if not _is_financial:
+        if not np.isnan(total_assets) and not np.isnan(current_liab):
+            capital_employed = total_assets - current_liab
+
+    if (not _is_financial and not np.isnan(ebit_ttm)
+            and not np.isnan(capital_employed) and capital_employed > 0):
+        roce = ebit_ttm / capital_employed * 100
+    else:
+        roce = np.nan
+
+    # ── Operating Margin = EBITDA(TTM) / Revenue(TTM)  [EBIT + Depreciation] ─
+    if (not np.isnan(ebit_ttm) and not np.isnan(revenue_ttm)
+            and revenue_ttm > 0):
+        if not np.isnan(depreciation_ttm):
+            ebitda = ebit_ttm + abs(depreciation_ttm)   # D&A is negative in CF
+        else:
+            ebitda = ebit_ttm                           # fallback: EBIT margin
+        operating_margin = ebitda / revenue_ttm * 100
+    else:
+        raw = float(info.get("operatingMargins") or np.nan)
+        operating_margin = raw * 100 if not np.isnan(raw) else np.nan
+
+    # ── Net Profit Margin = Net Income(TTM) / Revenue(TTM) ───────────────────
+    if (not np.isnan(net_income_ttm) and not np.isnan(revenue_ttm)
+            and revenue_ttm > 0):
+        net_profit_margin = net_income_ttm / revenue_ttm * 100
+    else:
+        raw = float(info.get("profitMargins") or np.nan)
+        net_profit_margin = raw * 100 if not np.isnan(raw) else np.nan
+
+    # ── ROE = Net Income(TTM) / Shareholders' Equity ──────────────────────────
+    if (not currency_mismatch and not np.isnan(net_income_ttm)
+            and not np.isnan(total_equity) and total_equity > 0):
+        roe = net_income_ttm / total_equity * 100
+    else:
+        raw = float(info.get("returnOnEquity") or np.nan)
+        roe = raw * 100 if not np.isnan(raw) else np.nan
+
+    # ── Net EPS = Net Income(TTM) / Shares Outstanding ────────────────────────
+    if (not currency_mismatch and not np.isnan(net_income_ttm)
+            and not np.isnan(shares) and shares > 0):
+        net_eps = net_income_ttm / shares
+    else:
+        net_eps = float(info.get("trailingEps") or np.nan)
+
+    # ── FCF and FCF Margin ────────────────────────────────────────────────────
+    if not np.isnan(op_cf_ttm) and not np.isnan(capex_ttm):
+        fcf = op_cf_ttm + capex_ttm          # capex stored as negative in yfinance CF
+    else:
+        fcf = _ttm(cf_q, cf_a, "Free Cash Flow")
+
+    fcf_margin = (fcf / revenue_ttm * 100
+                  if not np.isnan(fcf) and not np.isnan(revenue_ttm) and revenue_ttm > 0
+                  else np.nan)
+
+    # ── Capex / Sales ─────────────────────────────────────────────────────────
+    capex_sales = (abs(capex_ttm) / revenue_ttm * 100
+                   if not np.isnan(capex_ttm) and not np.isnan(revenue_ttm) and revenue_ttm > 0
+                   else np.nan)
+
+    # ── Receivable Days & Receivable/Sales  (denominator = TTM Revenue) ───────
+    if not np.isnan(receivables) and not np.isnan(revenue_ttm) and revenue_ttm > 0:
+        receivable_days  = receivables / revenue_ttm * 365
+        receivable_sales = receivables / revenue_ttm * 100
+    else:
+        receivable_days = receivable_sales = np.nan
+
+    # ── CCC: Inventory & Payable days use COGS (matching screener.in) ─────────
+    # If COGS unavailable fall back to revenue as cost base
+    cost_base = cogs_ttm if (not np.isnan(cogs_ttm) and cogs_ttm > 0) else revenue_ttm
+
+    inv_days = (inventory / cost_base * 365
+                if not np.isnan(inventory) and not np.isnan(cost_base) and cost_base > 0
+                else np.nan)
+
+    pay_days = (payables / cost_base * 365
+                if not np.isnan(payables) and not np.isnan(cost_base) and cost_base > 0
+                else np.nan)
+
+    if not np.isnan(receivable_days) and not np.isnan(inv_days) and not np.isnan(pay_days):
+        ccc = receivable_days + inv_days - pay_days
+    elif not np.isnan(receivable_days):
+        ccc = receivable_days          # partial CCC when inventory/payables missing
+    else:
+        ccc = np.nan
+
+    # ── Promoter Holding & Change — from screener.in (direct BSE filing data) ─
+    # Use the yf_ticker passed by the caller (e.g. "SINTERCOM.NS").
+    # Deriving it from ticker_obj.ticker is unreliable after unpickling.
+    sym_for_screener = yf_ticker or getattr(ticker_obj, "ticker", "") or ""
+    (promoter_holding,
+     change_promoter_holding,
+     top_promoter_name,
+     top_promoter_pct) = fetch_promoter_holding_screener(sym_for_screener)
+
+    # Fallback for promoter_holding only: heldPercentInsiders
+    if np.isnan(promoter_holding):
+        ph_raw = float(info.get("heldPercentInsiders") or np.nan)
+        promoter_holding = ph_raw * 100 if not np.isnan(ph_raw) else np.nan
+    # change_promoter_holding / top_promoter_* stay NaN if screener.in was unavailable
 
     return {
-        "price":         _last(close),
-        "sma20":         _last(sma20),
-        "sma50":         _last(sma50),
-        "sma200":        _last(sma200),
-        "w_sma200":      _last(w_sma200),
-        "w_sma20":       _last(w_sma20),
-        "rsi":           _last(rsi14),
-        "macd":          _last(macd_line),
-        "macd_signal":   _last(signal_line),
-        "macd_hist":     _last(histogram),
-        "atr":           _last(atr14),
-        "atr_pct":       _last(atr_pct),
-        "bb_upper":      _last(bb_upper),
-        "bb_lower":      _last(bb_lower),
-        "bb_pos":        _last(bb_pos),          # 0–100, higher = stronger
-        "bb_width":      _last(bb_width),
-        "obv":           _last(obv_series),
-        "obv_above_sma": int(_last(obv_series) > _last(obv_sma20)),
-        "vol_ratio":     _last(vol_ratio),       # today's vol / 20d avg
-        "vol_5d_vs_20d": int(_last(vol_sma5) > _last(vol_sma20)),
-        "pct_from_52h":  _last(pct_from_52h),
-        "pct_from_52l":  _last(pct_from_52l),
-        "roc1m":         _last(roc1m),
-        "roc3m":         _last(roc3m),
-        "roc6m":         _last(roc6m),
-        "golden_cross":  _last(golden_cross),
-        "above_sma20":   int(_last(close) > _last(sma20)),
-        "above_sma50":   int(_last(close) > _last(sma50)),
-        "above_sma200":  int(_last(close) > _last(sma200)),
-        "above_w200":    int(_last(close) > _last(w_sma200)) if not np.isnan(_last(w_sma200)) else 0,
+        "price":                   price,
+        "market_cap":              market_cap,           # INR — for UI cap-band tabs
+        "sector":                  sector,
+        "industry":                industry,
+        "pe_ratio":                pe_ratio,             # lower = cheaper
+        "ps_ratio":                ps_ratio,             # lower = cheaper
+        "roce":                    roce,                 # % — higher = better
+        "fcf":                     fcf,                  # absolute INR
+        "fcf_margin":              fcf_margin,           # % of revenue
+        "sales_growth":            sales_growth,         # % YoY
+        "capex_sales":             capex_sales,          # % — moderate is best
+        "receivable_sales":        receivable_sales,     # % — lower = better
+        "receivable_days":         receivable_days,      # days — lower = better
+        "ccc":                     ccc,                  # days — lower = better
+        "roe":                     roe,                  # % — higher = better
+        "operating_margin":        operating_margin,     # EBITDA% — higher = better
+        "net_profit_margin":       net_profit_margin,    # % — higher = better
+        "net_eps":                 net_eps,              # INR — higher = better
+        "promoter_holding":        promoter_holding,          # total promoter group % from screener.in
+        "change_promoter_holding": change_promoter_holding,   # QoQ change in pp
+        "top_promoter_name":       top_promoter_name,         # name of largest individual promoter
+        "top_promoter_pct":        top_promoter_pct,          # their individual holding %
+        "promoter_buying":         np.nan,
+        "order_book":              np.nan,
     }

@@ -1,16 +1,25 @@
 """
-Scores each stock out of 100 across five categories.
+Scores each stock out of 100 using fundamental ratios.
 
 Score breakdown (100 pts total):
-─────────────────────────────────────────────────────────
-  Category              Max pts   What it measures
-─────────────────────────────────────────────────────────
-  1. Trend              30        Is the stock in an uptrend?
-  2. Momentum           25        Is price acceleration positive?
-  3. Volume             20        Is smart money flowing in?
-  4. Relative Strength  15        How strong vs its own history?
-  5. Volatility/Setup   10        Is it stable and ready to move?
-─────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────
+  Category           Max pts   Metrics
+──────────────────────────────────────────────────────────────────────
+  1. Valuation          20     P/E ratio, Market Cap / Sales
+  2. Profitability      25     ROCE, Operating Margin, FCF Margin
+  3. Growth             20     Sales growth (YoY)
+  4. Efficiency         20     Cash Conversion Cycle,
+                               Receivable Days, Capex/Sales
+  5. Quality            15     Net Profit Margin, ROE,
+                               Receivable/Sales ratio
+──────────────────────────────────────────────────────────────────────
+
+Ratios not scored but stored and shown in reports / UI:
+  Net EPS, Promoter Holding % (proxy via heldPercentInsiders)
+
+Ratios NOT available via free APIs:
+  Change in Promoter Holding, Promoter Buying, Order Book,
+  Segmental Revenue, Sales Breakup
 """
 
 import math
@@ -20,24 +29,25 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ScoreBreakdown:
-    symbol:     str
-    name:       str
-    exchange:   str
-    cap:        str
-    price:      float
+    symbol:       str
+    name:         str
+    exchange:     str
+    cap:          str
+    price:        float
 
-    trend:      float = 0.0   # /30
-    momentum:   float = 0.0   # /25
-    volume:     float = 0.0   # /20
-    strength:   float = 0.0   # /15
-    setup:      float = 0.0   # /10
+    valuation:    float = 0.0   # /20  — PE + PS ratio
+    profitability:float = 0.0   # /25  — ROCE + FCF margin
+    growth:       float = 0.0   # /20  — Sales growth YoY
+    efficiency:   float = 0.0   # /20  — CCC + Receivable Days + Capex/Sales
+    quality:      float = 0.0   # /15  — Receivable/Sales + ROE
 
-    indicators: dict = field(default_factory=dict)
-    error:      str  = ""
+    indicators:   dict  = field(default_factory=dict)
+    error:        str   = ""
 
     @property
     def total(self) -> float:
-        return self.trend + self.momentum + self.volume + self.strength + self.setup
+        return (self.valuation + self.profitability + self.growth
+                + self.efficiency + self.quality)
 
     @property
     def grade(self) -> str:
@@ -60,7 +70,6 @@ class ScoreBreakdown:
 
 
 def _safe(v, fallback=0.0):
-    """Return fallback if value is NaN or None."""
     if v is None:
         return fallback
     try:
@@ -69,133 +78,252 @@ def _safe(v, fallback=0.0):
         return fallback
 
 
-def score_trend(ind: dict) -> float:
+def _has(v) -> bool:
+    """True if value is a usable non-NaN number."""
+    try:
+        return not math.isnan(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+# ─── Category 1: Valuation (20 pts) ──────────────────────────────────────────
+
+def score_valuation(ind: dict) -> float:
     """
-    30 points — Is the stock in a healthy uptrend?
+    20 points — Is the stock reasonably priced?
 
-    Points  Condition
-    ──────  ─────────────────────────────────────────────────
-     10     Price above weekly 200 SMA (major trend direction)
-      8     Price above daily 50 SMA   (intermediate trend)
-      7     Price above daily 20 SMA   (short-term trend)
-      5     Daily 50 SMA > 200 SMA (golden cross)
-    """
-    pts = 0.0
+    P/E Ratio (10 pts):
+      < 15        → 10   (value zone for Indian mid-caps)
+      15–25       →  8   (fairly valued)
+      25–40       →  5   (growth premium)
+      40–60       →  2   (expensive)
+      > 60 or ≤ 0 →  0   (overbought or losing money)
 
-    if _safe(ind.get("above_w200")):     pts += 10
-    if _safe(ind.get("above_sma50")):    pts += 8
-    if _safe(ind.get("above_sma20")):    pts += 7
-    if _safe(ind.get("golden_cross")):   pts += 5
-
-    return pts
-
-
-def score_momentum(ind: dict) -> float:
-    """
-    25 points — Is momentum positive and building?
-
-    Points  Condition
-    ──────  ──────────────────────────────────────────────────────────────
-     12     RSI: 50–65 → 12pts  |  65–75 → 8pts  |  40–50 → 5pts  |  else 0
-      8     MACD line above signal line (bullish crossover)
-      5     1-month price change > 0%
-    """
-    pts  = 0.0
-    rsi  = _safe(ind.get("rsi"), 50)
-    roc1 = _safe(ind.get("roc1m"), 0)
-
-    if   50 <= rsi < 65:  pts += 12
-    elif 65 <= rsi < 75:  pts += 8
-    elif 40 <= rsi < 50:  pts += 5
-    # RSI < 40 or > 75 → 0 (oversold/overbought)
-
-    macd_line = _safe(ind.get("macd"), 0)
-    macd_sig  = _safe(ind.get("macd_signal"), 0)
-    if macd_line > macd_sig:  pts += 8
-
-    if roc1 > 0:  pts += 5
-
-    return pts
-
-
-def score_volume(ind: dict) -> float:
-    """
-    20 points — Is buying volume healthy?
-
-    Points  Condition
-    ──────  ─────────────────────────────────────────────────────────────
-      8     5-day avg volume > 20-day avg (rising participation)
-      7     Today's volume > 1.5× the 20-day average (strong session)
-      5     OBV above its 20-day SMA (accumulation phase)
+    Market Cap / Sales — P/S ratio (10 pts):
+      < 1         → 10   (very cheap relative to revenue)
+      1–2         →  8
+      2–4         →  6
+      4–6         →  3
+      6–10        →  1
+      > 10        →  0
     """
     pts = 0.0
 
-    if _safe(ind.get("vol_5d_vs_20d")):   pts += 8
+    pe = _safe(ind.get("pe_ratio"), np.nan)
+    if _has(pe):
+        if   0 < pe < 15:  pts += 10
+        elif pe < 25:      pts += 8
+        elif pe < 40:      pts += 5
+        elif pe < 60:      pts += 2
 
-    vol_ratio = _safe(ind.get("vol_ratio"), 0)
-    if vol_ratio >= 1.5:    pts += 7
-    elif vol_ratio >= 1.1:  pts += 4
-
-    if _safe(ind.get("obv_above_sma")):   pts += 5
-
-    return pts
-
-
-def score_strength(ind: dict) -> float:
-    """
-    15 points — How strong is the stock relative to its own history?
-
-    Points  Condition
-    ──────  ──────────────────────────────────────────────────────────────
-      5     Within 10% of 52-week high  (near highs = strength)
-      5     3-month return > 5%         (positive medium-term momentum)
-      5     6-month return > 10%        (strong longer trend)
-    """
-    pts    = 0.0
-    h52pct = _safe(ind.get("pct_from_52h"), -100)   # 0 = at 52w high, negative = below
-    roc3   = _safe(ind.get("roc3m"), 0)
-    roc6   = _safe(ind.get("roc6m"), 0)
-
-    if h52pct >= -10:   pts += 5    # within 10% of 52w high
-    elif h52pct >= -20: pts += 2    # within 20%
-
-    if roc3 > 5:   pts += 5
-    elif roc3 > 0: pts += 2
-
-    if roc6 > 10:   pts += 5
-    elif roc6 > 0:  pts += 2
+    ps = _safe(ind.get("ps_ratio"), np.nan)
+    if _has(ps):
+        if   ps < 1:   pts += 10
+        elif ps < 2:   pts += 8
+        elif ps < 4:   pts += 6
+        elif ps < 6:   pts += 3
+        elif ps < 10:  pts += 1
 
     return pts
 
 
-def score_setup(ind: dict) -> float:
+# ─── Category 2: Profitability (25 pts) ──────────────────────────────────────
+
+def score_profitability(ind: dict) -> float:
     """
-    10 points — Is the stock in a stable, low-risk setup?
+    25 points — Is the business generating strong returns?
 
-    Points  Condition
-    ──────  ──────────────────────────────────────────────────────────────
-      5     ATR% < 2.5% (price is stable, not wildly volatile)
-      5     Bollinger Band position 40–70% (healthy mid-to-upper zone,
-             not overextended or at the bottom)
+    ROCE (10 pts):
+      > 25%  → 10   (exceptional capital efficiency)
+      > 20%  →  8
+      > 15%  →  6
+      > 10%  →  3
+      > 5%   →  1
+      ≤ 5%   →  0
+
+    Operating Profit Margin % (8 pts):
+      > 25%  →  8
+      > 20%  →  6
+      > 15%  →  4
+      > 10%  →  2
+      > 5%   →  1
+      ≤ 5%   →  0
+
+    Free Cash Flow margin — FCF / Revenue % (7 pts):
+      > 15%  →  7   (strong cash generation)
+      > 10%  →  5
+      >  5%  →  3
+      >  0%  →  2   (positive FCF — business is self-funding)
+      ≤  0%  →  0   (cash burn)
     """
-    pts     = 0.0
-    atr_pct = _safe(ind.get("atr_pct"), 999)
-    bb_pos  = _safe(ind.get("bb_pos"), 50)
+    pts = 0.0
 
-    if atr_pct < 2.0:   pts += 5
-    elif atr_pct < 3.0: pts += 3
-    elif atr_pct < 4.5: pts += 1
+    roce = _safe(ind.get("roce"), np.nan)
+    if _has(roce):
+        if   roce > 25: pts += 10
+        elif roce > 20: pts +=  8
+        elif roce > 15: pts +=  6
+        elif roce > 10: pts +=  3
+        elif roce >  5: pts +=  1
 
-    if 40 <= bb_pos <= 70:   pts += 5
-    elif 30 <= bb_pos < 40:  pts += 3
-    elif 70 < bb_pos <= 85:  pts += 3
+    opm = _safe(ind.get("operating_margin"), np.nan)
+    if _has(opm):
+        if   opm > 25: pts += 8
+        elif opm > 20: pts += 6
+        elif opm > 15: pts += 4
+        elif opm > 10: pts += 2
+        elif opm >  5: pts += 1
+
+    fcf_m = _safe(ind.get("fcf_margin"), np.nan)
+    if _has(fcf_m):
+        if   fcf_m > 15: pts += 7
+        elif fcf_m > 10: pts += 5
+        elif fcf_m >  5: pts += 3
+        elif fcf_m >  0: pts += 2
 
     return pts
 
+
+# ─── Category 3: Growth (20 pts) ─────────────────────────────────────────────
+
+def score_growth(ind: dict) -> float:
+    """
+    20 points — Is the business growing revenue consistently?
+
+    Sales growth YoY %:
+      > 30%  → 20   (hyper-growth)
+      > 20%  → 16
+      > 15%  → 12
+      > 10%  →  8
+      >  5%  →  4
+      0–5%   →  2   (slow but positive)
+      < 0%   →  0   (revenue declining)
+    """
+    pts = 0.0
+
+    sg = _safe(ind.get("sales_growth"), np.nan)
+    if _has(sg):
+        if   sg > 30: pts += 20
+        elif sg > 20: pts += 16
+        elif sg > 15: pts += 12
+        elif sg > 10: pts +=  8
+        elif sg >  5: pts +=  4
+        elif sg >  0: pts +=  2
+
+    return pts
+
+
+# ─── Category 4: Efficiency (20 pts) ─────────────────────────────────────────
+
+def score_efficiency(ind: dict) -> float:
+    """
+    20 points — How efficiently does the business manage working capital?
+
+    Cash Conversion Cycle — CCC in days (7 pts):
+      < 0    →  7   (collect before you pay — negative CCC is exceptional)
+      < 30   →  6
+      < 60   →  4
+      < 90   →  2
+      < 120  →  1
+      ≥ 120  →  0
+
+    Receivable Days (6 pts):
+      < 30   →  6   (fast collections)
+      < 60   →  4
+      < 90   →  2
+      ≥ 90   →  0
+
+    Capex / Sales % (7 pts):
+      2–8%   →  7   (healthy reinvestment for growth)
+      8–15%  →  5   (capital-intensive but investing)
+      0–2%   →  4   (asset-light but low reinvestment)
+      15–25% →  2   (very capital-heavy)
+      > 25%  →  0
+    """
+    pts = 0.0
+
+    ccc = _safe(ind.get("ccc"), np.nan)
+    if _has(ccc):
+        if   ccc < 0:   pts += 7
+        elif ccc < 30:  pts += 6
+        elif ccc < 60:  pts += 4
+        elif ccc < 90:  pts += 2
+        elif ccc < 120: pts += 1
+
+    rd = _safe(ind.get("receivable_days"), np.nan)
+    if _has(rd):
+        if   rd < 30: pts += 6
+        elif rd < 60: pts += 4
+        elif rd < 90: pts += 2
+
+    cs = _safe(ind.get("capex_sales"), np.nan)
+    if _has(cs):
+        if   2  <= cs <  8:  pts += 7
+        elif 8  <= cs < 15:  pts += 5
+        elif 0  <= cs <  2:  pts += 4
+        elif 15 <= cs < 25:  pts += 2
+
+    return pts
+
+
+# ─── Category 5: Quality (15 pts) ────────────────────────────────────────────
+
+def score_quality(ind: dict) -> float:
+    """
+    15 points — Is the business high quality with good shareholder returns?
+
+    Net Profit Margin % (5 pts):
+      > 20%  →  5
+      > 15%  →  4
+      > 10%  →  3
+      >  5%  →  1
+      ≤  5%  →  0
+
+    Return on Equity — ROE % (6 pts):
+      > 25%  →  6
+      > 20%  →  5
+      > 15%  →  3
+      > 10%  →  1
+      ≤ 10%  →  0
+
+    Receivable / Sales % (4 pts):
+      < 10%  →  4   (very tight receivables — little credit risk)
+      < 20%  →  3
+      < 30%  →  2
+      < 40%  →  1
+      ≥ 40%  →  0
+    """
+    pts = 0.0
+
+    npm = _safe(ind.get("net_profit_margin"), np.nan)
+    if _has(npm):
+        if   npm > 20: pts += 5
+        elif npm > 15: pts += 4
+        elif npm > 10: pts += 3
+        elif npm >  5: pts += 1
+
+    roe = _safe(ind.get("roe"), np.nan)
+    if _has(roe):
+        if   roe > 25: pts += 6
+        elif roe > 20: pts += 5
+        elif roe > 15: pts += 3
+        elif roe > 10: pts += 1
+
+    rs = _safe(ind.get("receivable_sales"), np.nan)
+    if _has(rs):
+        if   rs < 10: pts += 4
+        elif rs < 20: pts += 3
+        elif rs < 30: pts += 2
+        elif rs < 40: pts += 1
+
+    return pts
+
+
+# ─── Master scorer ────────────────────────────────────────────────────────────
 
 def score_stock(symbol: str, name: str, exchange: str, cap: str,
                 ind: dict) -> ScoreBreakdown:
-    """Compute the full score breakdown for a single stock."""
+    """Compute the full fundamental score breakdown for a single stock."""
     result = ScoreBreakdown(
         symbol=symbol, name=name, exchange=exchange, cap=cap,
         price=_safe(ind.get("price"), 0),
@@ -206,10 +334,10 @@ def score_stock(symbol: str, name: str, exchange: str, cap: str,
         result.error = "No indicator data"
         return result
 
-    result.trend    = round(score_trend(ind),    2)
-    result.momentum = round(score_momentum(ind), 2)
-    result.volume   = round(score_volume(ind),   2)
-    result.strength = round(score_strength(ind), 2)
-    result.setup    = round(score_setup(ind),    2)
+    result.valuation    = round(score_valuation(ind),    2)
+    result.profitability= round(score_profitability(ind),2)
+    result.growth       = round(score_growth(ind),       2)
+    result.efficiency   = round(score_efficiency(ind),   2)
+    result.quality      = round(score_quality(ind),      2)
 
     return result

@@ -104,6 +104,10 @@ def main():
                         help="Log a trade: --add SYMBOL QTY ENTRY STOP TARGET ATR")
     parser.add_argument("--remove", metavar="SYMBOL",
                         help="Remove a closed position from tracking")
+    parser.add_argument("--chart", nargs="+", metavar="SYMBOL",
+                        help="Generate a candlestick chart for one or more symbols")
+    parser.add_argument("--chart-signals", action="store_true",
+                        help="Generate charts for every current BUY signal")
 
     args = parser.parse_args()
 
@@ -140,6 +144,30 @@ def main():
             console.print(f"\n[green]✔ Removed[/green] [bold cyan]{sym}[/bold cyan] from tracking.\n")
         else:
             console.print(f"\n[yellow]⚠  {sym} not found in positions.[/yellow]\n")
+        return
+
+    # ── Chart commands ────────────────────────────────────────────────────────
+    if args.chart:
+        from live_signals.charts import chart_symbol
+        console.print()
+        for sym in args.chart:
+            chart_symbol(sym.upper())
+        console.print()
+        return
+
+    if args.chart_signals:
+        from live_signals.charts import chart_symbol
+        from live_signals.scanner import run_scan
+        console.print(f"\n  [dim]Scanning {len(symbols)} symbols for BUY signals…[/dim]")
+        results = run_scan(symbols, portfolio.load())
+        buys    = results["buys"]
+        if not buys:
+            console.print("  [yellow]No BUY signals right now — nothing to chart.[/yellow]\n")
+            return
+        console.print(f"  [green]{len(buys)} BUY signal(s) found — generating charts…[/green]\n")
+        for sig in buys:
+            chart_symbol(sig.symbol)
+        console.print()
         return
 
     # ── Positions-only view ───────────────────────────────────────────────────

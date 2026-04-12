@@ -45,6 +45,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 warnings.filterwarnings("ignore")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("peewee").setLevel(logging.CRITICAL)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yfinance as yf
@@ -56,7 +58,7 @@ from rich.progress import (
 )
 
 from stock_screener.universe   import get_universe, summary as universe_summary, Stock
-from stock_screener.indicators import compute_all
+from stock_screener.indicators import compute_fundamentals
 from stock_screener.scorer     import score_stock, ScoreBreakdown
 from stock_screener.report     import generate_report
 
@@ -69,50 +71,81 @@ CACHE_DIR   = os.path.join(os.path.dirname(__file__), "data_cache")
 
 # ─── Data fetching ────────────────────────────────────────────────────────────
 
-def fetch_ohlcv(yf_ticker: str, cache_dir: str | None) -> pd.DataFrame | None:
-    """
-    Download 5 years of daily OHLCV. Uses local cache if available.
-    Cache files are CSV stored in data_cache/.
-    """
-    safe_name  = yf_ticker.replace(".", "_").replace("/", "_")
-    cache_path = os.path.join(cache_dir, f"{safe_name}.csv") if cache_dir else None
+import pickle
+from datetime import datetime, timedelta
 
+CACHE_TTL_HOURS = 24   # re-fetch fundamentals after 24 hours
+
+
+def _load_cache(cache_dir: str, symbol: str):
+    """Load cached fundamental data. Returns (info, ticker_obj) or None if stale/missing."""
+    if not cache_dir:
+        return None
+    path = os.path.join(cache_dir, f"{symbol}_fundamentals.pkl")
+    if not os.path.exists(path):
+        return None
+    age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(path))
+    if age > timedelta(hours=CACHE_TTL_HOURS):
+        return None
     try:
-        if cache_path and os.path.exists(cache_path):
-            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-        else:
-            df = yf.download(yf_ticker, period="5y", interval="1d",
-                             progress=False, auto_adjust=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.dropna(inplace=True)
-            if cache_path and not df.empty:
-                df.to_csv(cache_path)
-
-        return df if len(df) >= 60 else None
-
+        with open(path, "rb") as f:
+            return pickle.load(f)
     except Exception:
         return None
 
 
-def fetch_and_score(stock: Stock, cache_dir: str | None) -> ScoreBreakdown:
-    """Download data + compute indicators + score — runs inside a thread."""
-    df = fetch_ohlcv(stock.yf_ticker, cache_dir)
+def _save_cache(cache_dir: str, symbol: str, data: dict):
+    if not cache_dir:
+        return
+    path = os.path.join(cache_dir, f"{symbol}_fundamentals.pkl")
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
 
-    if df is None or df.empty:
+
+def fetch_and_score(stock: Stock, cache_dir: str | None) -> ScoreBreakdown:
+    """Fetch fundamental data + compute ratios + score — runs inside a thread."""
+    yf_ticker = stock.yf_ticker
+
+    # Try cache first
+    cached = _load_cache(cache_dir, stock.symbol)
+    if cached:
+        info       = cached["info"]
+        ticker_obj = cached["ticker_obj"]
+    else:
+        try:
+            ticker_obj = yf.Ticker(yf_ticker)
+            info       = ticker_obj.info or {}
+            if not info or "marketCap" not in info:
+                return ScoreBreakdown(
+                    symbol=stock.symbol, name=stock.name,
+                    exchange=stock.exchange, cap=stock.cap,
+                    price=0, error="No fundamental data",
+                )
+            _save_cache(cache_dir, stock.symbol, {"info": info, "ticker_obj": ticker_obj})
+        except Exception as e:
+            return ScoreBreakdown(
+                symbol=stock.symbol, name=stock.name,
+                exchange=stock.exchange, cap=stock.cap,
+                price=0, error=str(e),
+            )
+
+    try:
+        ind = compute_fundamentals(ticker_obj, info, yf_ticker=yf_ticker)
+    except Exception as e:
         return ScoreBreakdown(
             symbol=stock.symbol, name=stock.name,
             exchange=stock.exchange, cap=stock.cap,
-            price=0, error="No data / delisted",
+            price=0, error=f"Indicator error: {e}",
         )
 
-    ind    = compute_all(df)
-    result = score_stock(
+    return score_stock(
         symbol=stock.symbol, name=stock.name,
         exchange=stock.exchange, cap=stock.cap,
         ind=ind,
     )
-    return result
 
 
 # ─── Parallel screener ────────────────────────────────────────────────────────

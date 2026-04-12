@@ -42,13 +42,12 @@ _SMALLCAP_100_URL  = "https://nsearchives.nseindia.com/content/indices/ind_nifty
 # ─── BSE bhav copy (latest trading day equity list) ──────────────────────────
 # BSE publishes a daily bhavcopy with all traded stocks.
 # We use it to capture BSE-only stocks (those not on NSE).
-# BSE bhavcopy — BSE changed their URL scheme; we try multiple patterns.
-# If all fail, BSE-only stocks are simply skipped (most trade on NSE anyway).
-_BSE_BHAVCOPY_URLS = [
-    "https://www.bseindia.com/download/BhavCopy/Equity/EQ{date}_CSV.ZIP",
-    "https://www.bseindia.com/bsedownloads/BhavCopy/Equity/EQ{date}_CSV.ZIP",
-    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",  # fallback: skip BSE
-]
+# Old EQ{DDMMYY}_CSV.ZIP format was discontinued by BSE on 8 Jul 2024.
+# New formats (date tokens filled in per-request, not stored here):
+#   ZIP  : BSE_EQ_BHAVCOPY_{DDMMYYYY}_T0.ZIP  (contains a .CSV inside)
+#   CSV  : BhavCopy_BSE_CM_0_0_0_{YYYYMMDD}_F_0000.CSV  (direct CSV, no ZIP)
+#   ISIN : EQ_ISINCODE_{DDMMYY}_T0.CSV  (direct CSV, ISIN-based)
+_BSE_BASE = "https://www.bseindia.com/download/BhavCopy/Equity/"
 
 CACHE_DIR   = os.path.join(os.path.dirname(__file__), "data_cache")
 CACHE_FILE  = os.path.join(CACHE_DIR, "universe_cache.csv")
@@ -137,44 +136,92 @@ def _fetch_all_nse_equities() -> dict[str, str]:
 
 def _fetch_bse_equities() -> dict[str, str]:
     """
-    Fetch today's (or yesterday's) BSE bhavcopy ZIP for BSE-only stocks.
-    Falls back gracefully if unavailable.
+    Fetch the latest BSE bhavcopy for BSE-only stocks.
+    Tries the three current URL formats (post-July 2024) silently,
+    falls back gracefully if all fail.
     Returns {BSE_CODE (as string): company_name}
     """
     import zipfile
+    import requests as _req
 
-    for days_back in range(1, 7):      # start from yesterday, go back up to 6 days
-        dt = datetime.today() - timedelta(days=days_back)
-        if dt.weekday() >= 5:          # skip weekends
-            continue
-        date_str = dt.strftime("%d%m%y")
-        raw = None
-        for url_template in _BSE_BHAVCOPY_URLS:
-            url = url_template.format(date=date_str)
-            raw = _get(url, timeout=15)
-            if raw:
-                break
-        if raw is None:
-            continue
+    def _try(url: str) -> bytes | None:
+        """Silent fetch — no WARNING logged on 404."""
         try:
-            with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                csv_name = [n for n in z.namelist() if n.endswith(".CSV")][0]
-                with z.open(csv_name) as f:
-                    df = pd.read_csv(f)
-            df.columns = df.columns.str.strip()
-            # BSE bhavcopy columns: SC_CODE, SC_NAME, SC_GROUP, SC_TYPE, ...
-            # Keep A/B group equities (mid/small liquids)
+            r = _req.get(url, headers=_NSE_HEADERS, timeout=15)
+            r.raise_for_status()
+            return r.content
+        except Exception:
+            return None
+
+    def _parse_zip(raw: bytes) -> dict[str, str]:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            csv_name = next(n for n in z.namelist()
+                            if n.upper().endswith(".CSV"))
+            with z.open(csv_name) as f:
+                df = pd.read_csv(f)
+        df.columns = df.columns.str.strip()
+        # New ZIP format: TckrSymb / FinInstrmId = BSE code, SctySrs = EQ
+        if "TckrSymb" in df.columns:
+            if "SctySrs" in df.columns:
+                df = df[df["SctySrs"].str.strip() == "EQ"]
+            name_col = "FinInstrmNm" if "FinInstrmNm" in df.columns else "TckrSymb"
+            return {str(r["TckrSymb"]).strip(): str(r[name_col]).strip()
+                    for _, r in df.iterrows() if str(r["TckrSymb"]).strip()}
+        # Old ZIP format: SC_CODE, SC_NAME, SC_GROUP
+        if "SC_CODE" in df.columns:
             if "SC_GROUP" in df.columns:
                 df = df[df["SC_GROUP"].isin(["A", "B", "T"])]
-            return {
-                str(row["SC_CODE"]).strip(): str(row["SC_NAME"]).strip()
-                for _, row in df.iterrows()
-                if str(row.get("SC_CODE", "")).strip()
-            }
-        except Exception as e:
-            logger.debug(f"BSE bhavcopy parse error ({date_str}): {e}")
+            return {str(r["SC_CODE"]).strip(): str(r["SC_NAME"]).strip()
+                    for _, r in df.iterrows() if str(r.get("SC_CODE", "")).strip()}
+        return {}
 
-    logger.warning("Could not fetch BSE bhavcopy — BSE stocks skipped.")
+    def _parse_csv(raw: bytes) -> dict[str, str]:
+        df = pd.read_csv(io.BytesIO(raw))
+        df.columns = df.columns.str.strip()
+        # UDiFF CSV format: TckrSymb, FinInstrmNm, SctySrs (BSE group: A/B/T/Z…)
+        # FinInstrmTp == "STK" keeps equities only (excludes derivatives)
+        if "TckrSymb" in df.columns:
+            if "FinInstrmTp" in df.columns:
+                df = df[df["FinInstrmTp"].str.strip() == "STK"]
+            # Keep liquid groups A, B, T; drop Z (suspended), others
+            if "SctySrs" in df.columns:
+                df = df[df["SctySrs"].str.strip().isin(["A", "B", "T"])]
+            name_col = next((c for c in ("FinInstrmNm", "ShrtNm", "TckrSymb")
+                             if c in df.columns), "TckrSymb")
+            return {str(r["TckrSymb"]).strip(): str(r[name_col]).strip()
+                    for _, r in df.iterrows() if str(r["TckrSymb"]).strip()}
+        return {}
+
+    for days_back in range(1, 7):          # try yesterday back to 6 days ago
+        dt = datetime.today() - timedelta(days=days_back)
+        if dt.weekday() >= 5:              # skip weekends
+            continue
+
+        ddmmyyyy = dt.strftime("%d%m%Y")   # e.g. 20032026
+        yyyymmdd = dt.strftime("%Y%m%d")   # e.g. 20260320
+        ddmmyy   = dt.strftime("%d%m%y")   # e.g. 200326
+
+        attempts = [
+            # Format 1: new ZIP (post-Jul 2024)
+            (_try(f"{_BSE_BASE}BSE_EQ_BHAVCOPY_{ddmmyyyy}_T0.ZIP"), "zip"),
+            # Format 2: UDiFF direct CSV
+            (_try(f"{_BSE_BASE}BhavCopy_BSE_CM_0_0_0_{yyyymmdd}_F_0000.CSV"), "csv"),
+            # Format 3: ISIN-based CSV
+            (_try(f"{_BSE_BASE}EQ_ISINCODE_{ddmmyy}_T0.CSV"), "csv"),
+        ]
+
+        for raw, fmt in attempts:
+            if not raw:
+                continue
+            try:
+                result = _parse_zip(raw) if fmt == "zip" else _parse_csv(raw)
+                if result:
+                    logger.debug(f"BSE bhavcopy loaded for {dt.date()} ({len(result)} stocks)")
+                    return result
+            except Exception as e:
+                logger.debug(f"BSE parse error ({dt.date()}): {e}")
+
+    logger.warning("BSE bhavcopy unavailable — BSE-only stocks skipped (NSE stocks unaffected).")
     return {}
 
 
