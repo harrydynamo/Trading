@@ -18,17 +18,17 @@ import subprocess
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
+import urllib.request
 
-# ── Resolve project root (works both as .py and as frozen .exe) ───────────────
+# ── Resolve project root ──────────────────────────────────────────────────────
 if getattr(sys, "frozen", False):
-    ROOT = sys._MEIPASS          # PyInstaller temp folder
-    PYTHON = sys.executable      # the bundled python
+    ROOT   = sys._MEIPASS
+    PYTHON = sys.executable
 else:
     ROOT   = os.path.dirname(os.path.abspath(__file__))
     PYTHON = sys.executable
 
-os.chdir(ROOT)   # ensure relative imports work
-
+os.chdir(ROOT)
 
 # ── App definitions ───────────────────────────────────────────────────────────
 APPS = {
@@ -52,8 +52,14 @@ APPS = {
     },
 }
 
-# Track running processes
 _procs: dict[str, subprocess.Popen] = {}
+_log_var: tk.StringVar | None = None   # status label StringVar
+
+
+def _log(msg: str):
+    """Update the status bar text (thread-safe)."""
+    if _log_var:
+        _log_var.set(msg)
 
 
 def _streamlit_cmd(script: str, port: int) -> list[str]:
@@ -67,64 +73,103 @@ def _streamlit_cmd(script: str, port: int) -> list[str]:
     ]
 
 
-def _open_browser(port: int, delay: float = 6.0):
-    """Poll until the server responds, then open browser (max 60s)."""
-    import urllib.request
-    def _wait_and_open():
-        url = f"http://localhost:{port}"
-        deadline = time.time() + 60
-        time.sleep(delay)   # initial grace period
-        while time.time() < deadline:
-            try:
-                urllib.request.urlopen(url, timeout=1)
-                break          # server is up
-            except Exception:
-                time.sleep(1)
-        webbrowser.open(url)
-    threading.Thread(target=_wait_and_open, daemon=True).start()
+def _wait_and_open(port: int, btn: tk.Button, name: str):
+    """Background thread: poll until server is up, then open browser."""
+    url      = f"http://localhost:{port}"
+    deadline = time.time() + 90   # wait up to 90 seconds
+
+    _log(f"Starting server on port {port}…")
+
+    # Give process a moment to spin up before polling
+    time.sleep(4)
+
+    while time.time() < deadline:
+        # Check if process died already
+        proc = _procs.get(name)
+        if proc and proc.poll() is not None:
+            _log(f"❌  Server failed to start. Check that streamlit is installed: pip install streamlit")
+            return
+
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            break   # server responded
+        except Exception:
+            _log(f"Waiting for server… ({int(deadline - time.time())}s left)")
+            time.sleep(2)
+    else:
+        _log(f"⚠️  Timed out. Try opening manually: {url}")
+        return
+
+    _log(f"✅  Running at {url}  — opening browser…")
+    try:
+        # os.startfile is the most reliable way to open a URL on Windows
+        if sys.platform == "win32":
+            os.startfile(url)
+        else:
+            webbrowser.open(url)
+    except Exception:
+        _log(f"✅  Open your browser and go to: {url}")
 
 
-def launch(name: str, btn: tk.Button, status_var: tk.StringVar):
+def launch(name: str, btn: tk.Button):
     app = APPS[name]
 
-    # If already running, just open browser
+    # Already running — just open browser
     if name in _procs and _procs[name].poll() is None:
         if app["mode"] == "streamlit":
-            webbrowser.open(f"http://localhost:{app['port']}")
+            url = f"http://localhost:{app['port']}"
+            try:
+                if sys.platform == "win32":
+                    os.startfile(url)
+                else:
+                    webbrowser.open(url)
+            except Exception:
+                _log(f"Open your browser and go to: {url}")
         return
 
     if app["mode"] == "streamlit":
-        cmd  = _streamlit_cmd(app["script"], app["port"])
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=ROOT,
-        )
+        cmd = _streamlit_cmd(app["script"], app["port"])
+
+        # Write stdout/stderr to a log file so errors are visible
+        log_path = os.path.join(ROOT, f"streamlit_{app['port']}.log")
+        log_file = open(log_path, "w")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=log_file,
+                cwd=ROOT,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except FileNotFoundError:
+            _log("❌  Python not found. Make sure Python is in PATH.")
+            return
+
         _procs[name] = proc
-        _open_browser(app["port"])
         btn.config(text="🟢  Open in Browser", bg="#1a7a3c", fg="white")
-        status_var.set(f"Starting… browser will open at http://localhost:{app['port']}")
+
+        threading.Thread(
+            target=_wait_and_open,
+            args=(app["port"], btn, name),
+            daemon=True,
+        ).start()
 
     elif app["mode"] == "terminal":
-        # Open a new terminal window
         if sys.platform == "win32":
             subprocess.Popen(
-                ["cmd", "/c", "start", "cmd", "/k",
-                 PYTHON, app["script"]],
-                cwd=ROOT,
+                f'start cmd /k "{PYTHON}" "{app["script"]}"',
+                shell=True, cwd=ROOT,
             )
         elif sys.platform == "darwin":
-            app_script = app["script"]
-            osa = f'tell application "Terminal" to do script "cd {ROOT} && {PYTHON} {app_script}"'
+            osa = f'tell application "Terminal" to do script "cd {ROOT} && {PYTHON} {app["script"]}"'
             subprocess.Popen(["osascript", "-e", osa])
         else:
             subprocess.Popen(
-                ["x-terminal-emulator", "-e",
-                 f"{PYTHON} {app['script']}"],
+                ["x-terminal-emulator", "-e", f"{PYTHON} {app['script']}"],
                 cwd=ROOT,
             )
-        status_var.set("Launched in new terminal window")
+        _log("Launched in new terminal window")
 
 
 def stop_all():
@@ -136,11 +181,12 @@ def stop_all():
 
 
 def build_ui(root: tk.Tk):
+    global _log_var
+
     root.title("Trading Suite")
     root.resizable(False, False)
     root.configure(bg="#f8f9fa")
 
-    # Try to set window icon (ignored gracefully if missing)
     try:
         ico = os.path.join(ROOT, "trading_ui", "icon.ico")
         if os.path.exists(ico):
@@ -148,7 +194,7 @@ def build_ui(root: tk.Tk):
     except Exception:
         pass
 
-    # ── Header ──────────────────────────────────────────────────────────────
+    # ── Header ───────────────────────────────────────────────────────────────
     hdr = tk.Frame(root, bg="#1a3a6e", pady=16)
     hdr.pack(fill="x")
     tk.Label(hdr, text="📈  Trading Suite", font=("Segoe UI", 20, "bold"),
@@ -156,11 +202,9 @@ def build_ui(root: tk.Tk):
     tk.Label(hdr, text="NSE / BSE — Live Charts · Screener · Signals",
              font=("Segoe UI", 10), bg="#1a3a6e", fg="#aac4f0").pack()
 
-    # ── App cards ───────────────────────────────────────────────────────────
+    # ── App cards ────────────────────────────────────────────────────────────
     card_frame = tk.Frame(root, bg="#f8f9fa", padx=24, pady=20)
     card_frame.pack(fill="both", expand=True)
-
-    status_var = tk.StringVar(value="Select an app to launch")
 
     for name, app in APPS.items():
         card = tk.Frame(card_frame, bg="white", relief="flat",
@@ -186,17 +230,18 @@ def build_ui(root: tk.Tk):
             relief="flat", padx=16, pady=6, cursor="hand2",
             activebackground="#1446a0", activeforeground="white",
         )
-        btn.config(command=lambda n=name, b=btn, s=status_var: launch(n, b, s))
+        btn.config(command=lambda n=name, b=btn: launch(n, b))
         btn.pack(side="right", padx=4)
 
-    # ── Status bar ──────────────────────────────────────────────────────────
-    sep = ttk.Separator(root, orient="horizontal")
-    sep.pack(fill="x", padx=0)
+    # ── Status bar ───────────────────────────────────────────────────────────
+    ttk.Separator(root, orient="horizontal").pack(fill="x")
 
     bottom = tk.Frame(root, bg="#f0f2f5", pady=8, padx=16)
     bottom.pack(fill="x")
-    tk.Label(bottom, textvariable=status_var, font=("Segoe UI", 9),
-             bg="#f0f2f5", fg="#555").pack(side="left")
+
+    _log_var = tk.StringVar(value="Select an app to launch")
+    tk.Label(bottom, textvariable=_log_var, font=("Segoe UI", 9),
+             bg="#f0f2f5", fg="#555", wraplength=380, justify="left").pack(side="left")
     tk.Button(bottom, text="⏹ Stop All", font=("Segoe UI", 9),
               bg="#c0392b", fg="white", relief="flat", padx=10, pady=3,
               cursor="hand2", command=stop_all).pack(side="right")
@@ -204,7 +249,7 @@ def build_ui(root: tk.Tk):
 
 def main():
     root = tk.Tk()
-    root.geometry("520x400")
+    root.geometry("520x420")
     build_ui(root)
     root.protocol("WM_DELETE_WINDOW", lambda: (stop_all(), root.destroy()))
     root.mainloop()
