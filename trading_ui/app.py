@@ -1523,8 +1523,15 @@ prev_close = float(df_raw["Close"].iloc[-2]) if len(df_raw) > 1 else last_close
 change_abs = last_close - prev_close
 change_pct = change_abs / prev_close * 100 if prev_close else 0.0
 volume     = int(df_raw["Volume"].iloc[-1])
-day_high   = float(df_raw["High"].iloc[-1])
-day_low    = float(df_raw["Low"].iloc[-1])
+
+# Day high/low: always use the daily candle so intraday TFs show the real range
+_df_daily  = fetch_ohlcv(yf_ticker, "1d", "5d")
+if _df_daily is not None and len(_df_daily) >= 1:
+    day_high = float(_df_daily["High"].iloc[-1])
+    day_low  = float(_df_daily["Low"].iloc[-1])
+else:
+    day_high = float(df_raw["High"].max())
+    day_low  = float(df_raw["Low"].min())
 
 is_up = change_pct >= 0
 
