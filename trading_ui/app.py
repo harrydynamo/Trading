@@ -759,6 +759,10 @@ def fetch_ohlcv(yf_ticker: str, interval: str, period: str) -> pd.DataFrame | No
                          progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        # squeeze any remaining single-column DataFrames to Series
+        for col in df.columns:
+            if isinstance(df[col], pd.DataFrame):
+                df[col] = df[col].squeeze()
         df = df.dropna()
         return df if not df.empty and len(df) >= 20 else None
     except Exception:

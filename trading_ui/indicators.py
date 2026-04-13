@@ -228,7 +228,11 @@ def compute_all(
 ) -> pd.DataFrame:
     """Enrich a raw OHLCV DataFrame with all technical indicators."""
     d = df.copy()
-    c = d["Close"]
+    # Flatten MultiIndex columns that newer yfinance versions sometimes return
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    # Ensure Close is a Series, not a single-column DataFrame
+    c = d["Close"].squeeze()
 
     d["ema_9"]   = ema(c, 9)
     d["ema_21"]  = ema(c, 21)
