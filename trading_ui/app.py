@@ -752,17 +752,30 @@ def load_universe() -> dict:
     return result
 
 
+def _flatten_yf(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Newer yfinance (0.2.50+) returns a MultiIndex columns DataFrame even
+    for single-ticker downloads. Flatten it to plain Open/High/Low/Close/Volume.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # Level 0 = price type (Close/High/...), level 1 = ticker symbol
+        df = df.droplevel(level=1, axis=1)
+        # After droplevel there may be duplicate column names if somehow
+        # multiple tickers slipped in — keep only the first occurrence
+        df = df.loc[:, ~df.columns.duplicated()]
+    # Ensure every column is a plain 1-D Series
+    for col in list(df.columns):
+        if isinstance(df[col], pd.DataFrame):
+            df[col] = df[col].iloc[:, 0]
+    return df
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_ohlcv(yf_ticker: str, interval: str, period: str) -> pd.DataFrame | None:
     try:
         df = yf.download(yf_ticker, period=period, interval=interval,
                          progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        # squeeze any remaining single-column DataFrames to Series
-        for col in df.columns:
-            if isinstance(df[col], pd.DataFrame):
-                df[col] = df[col].squeeze()
+        df = _flatten_yf(df)
         df = df.dropna()
         return df if not df.empty and len(df) >= 20 else None
     except Exception:
