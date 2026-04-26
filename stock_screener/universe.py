@@ -38,6 +38,7 @@ _EQUITY_LIST_URL   = "https://nsearchives.nseindia.com/content/equities/EQUITY_L
 _MIDCAP_150_URL    = "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv"
 _SMALLCAP_250_URL  = "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv"
 _SMALLCAP_100_URL  = "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap100list.csv"
+_SME_EMERGE_URL    = "https://nsearchives.nseindia.com/emerge/corporates/content/SME_EQUITY_L.csv"
 
 # ─── BSE bhav copy (latest trading day equity list) ──────────────────────────
 # BSE publishes a daily bhavcopy with all traded stocks.
@@ -66,8 +67,10 @@ class Stock:
 
     @property
     def yf_ticker(self) -> str:
-        suffix = ".NS" if self.exchange == "NSE" else ".BO"
-        return self.symbol + suffix
+        if self.exchange == "NSE":
+            # NSE Emerge (SME) stocks use the -SM suffix on Yahoo Finance
+            return f"{self.symbol}-SM.NS" if self.cap == "sme" else f"{self.symbol}.NS"
+        return f"{self.symbol}.BO"
 
 
 # ─── Fetch helpers ────────────────────────────────────────────────────────────
@@ -123,14 +126,72 @@ def _fetch_all_nse_equities() -> dict[str, str]:
         df.columns = df.columns.str.strip()   # remove leading/trailing spaces
         # Keep only regular equity (EQ) — exclude SM, BE, BL, etc.
         series_col = "SERIES"
+        _SKIP = ("-RE", "-PP", "-N", "-W", "-SPE")
         eq = df[df[series_col].str.strip() == "EQ"]
         return {
             str(row["SYMBOL"]).strip(): str(row["NAME OF COMPANY"]).strip()
             for _, row in eq.iterrows()
             if str(row["SYMBOL"]).strip()
+            and not any(str(row["SYMBOL"]).strip().upper().endswith(s) for s in _SKIP)
         }
     except Exception as e:
         logger.warning(f"Could not parse EQUITY_L: {e}")
+        return {}
+
+
+def _fetch_nse_sme() -> dict[str, str]:
+    """
+    Download NSE Emerge (SME) equity list.
+    Returns {SYMBOL: company_name} for SME-listed stocks.
+    CSV format: SYMBOL, NAME OF COMPANY, SERIES, ...
+    Falls back to parsing EQUITY_L.csv series='SM' if the dedicated URL fails.
+
+    Filters out non-tradeable instruments:
+      -RE  rights entitlements (temporary, no OHLCV on yfinance)
+      -PP  partly-paid shares
+      -N   new / odd-lot series
+    """
+    # Suffixes that indicate non-tradeable temporary instruments
+    _SKIP_SUFFIXES = ("-RE", "-PP", "-N", "-W", "-SPE")
+
+    def _clean(result: dict) -> dict:
+        return {
+            sym: name for sym, name in result.items()
+            if not any(sym.upper().endswith(s) for s in _SKIP_SUFFIXES)
+        }
+
+    # Try dedicated NSE Emerge URL first
+    raw = _get(_SME_EMERGE_URL)
+    if raw:
+        try:
+            df = pd.read_csv(io.BytesIO(raw))
+            df.columns = df.columns.str.strip()
+            sym_col  = next((c for c in df.columns if "SYMBOL" in c.upper()), None)
+            name_col = next((c for c in df.columns if "NAME" in c.upper()), None)
+            if sym_col and name_col:
+                return _clean({
+                    str(row[sym_col]).strip(): str(row[name_col]).strip()
+                    for _, row in df.iterrows()
+                    if str(row[sym_col]).strip()
+                })
+        except Exception as e:
+            logger.debug(f"SME_EQUITY_L parse error: {e}")
+
+    # Fallback: parse EQUITY_L.csv keeping series "SM" (NSE Emerge)
+    raw = _get(_EQUITY_LIST_URL)
+    if raw is None:
+        return {}
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+        df.columns = df.columns.str.strip()
+        sme = df[df["SERIES"].str.strip() == "SM"]
+        return _clean({
+            str(row["SYMBOL"]).strip(): str(row["NAME OF COMPANY"]).strip()
+            for _, row in sme.iterrows()
+            if str(row["SYMBOL"]).strip()
+        })
+    except Exception as e:
+        logger.warning(f"Could not parse SME from EQUITY_L: {e}")
         return {}
 
 
@@ -253,14 +314,25 @@ def _build_universe() -> list[Stock]:
     console.print("  [dim]Fetching ALL NSE EQ-series equities…[/dim]")
     all_nse = _fetch_all_nse_equities()                     # ~2000 stocks
 
+    console.print("  [dim]Fetching NSE Emerge (SME) equities…[/dim]")
+    all_sme = _fetch_nse_sme()                              # ~700 SME stocks
+
     console.print("  [dim]Fetching BSE daily bhavcopy…[/dim]")
     all_bse = _fetch_bse_equities()
 
     stocks: list[Stock] = []
     seen_isins: set[str] = set()
 
-    # ── NSE stocks ────────────────────────────────────────────────────────────
+    # ── NSE SME stocks (NSE Emerge) ───────────────────────────────────────────
+    for symbol, name in all_sme.items():
+        stocks.append(Stock(symbol=symbol, name=name, cap="sme",
+                            exchange="NSE", industry=""))
+        seen_isins.add(symbol)
+
+    # ── NSE main-board stocks ─────────────────────────────────────────────────
     for symbol, name in all_nse.items():
+        if symbol in seen_isins:
+            continue   # already added as SME
         if symbol in midcap_map:
             cap = "midcap"
             _, industry = midcap_map[symbol]
@@ -289,7 +361,7 @@ def _build_universe() -> list[Stock]:
 
     logger.info(f"Universe: {len(stocks)} total  "
                 f"({len(midcap_map)} midcap, {len(smallcap_map)} smallcap, "
-                f"{bse_added} BSE-only)")
+                f"{len(all_sme)} SME, {bse_added} BSE-only)")
     return stocks
 
 

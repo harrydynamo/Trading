@@ -5,7 +5,7 @@ Run with:
     streamlit run trading_ui/app.py
 """
 
-import os, re, sys, warnings, logging, calendar, json, uuid
+import os, re, sys, time, warnings, logging, calendar, json, uuid
 from datetime import date, timedelta
 warnings.filterwarnings("ignore")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -888,6 +888,277 @@ def scan_pullback_stocks(include_microcap: bool = False) -> pd.DataFrame:
     return df_out
 
 
+# ── NSE Bhavcopy helpers for SME OHLCV ───────────────────────────────────────
+
+def _nse_bhavcopy_dates(n_days: int = 60) -> list[str]:
+    """Return last n_days calendar dates (YYYYMMDD) excluding weekends, newest first."""
+    from datetime import date, timedelta
+    result = []
+    d = date.today()
+    while len(result) < n_days:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:            # Mon-Fri only
+            result.append(d.strftime("%Y%m%d"))
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_nse_bhavcopy_day(date_str: str) -> pd.DataFrame:
+    """Download one NSE CM bhavcopy ZIP and return SM-series rows."""
+    import io, zipfile, urllib.request
+    url = (
+        f"https://nsearchives.nseindia.com/content/cm/"
+        f"BhavCopy_NSE_CM_0_0_0_{date_str}_F_0000.csv.zip"
+    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Referer": "https://www.nseindia.com/",
+    }
+    try:
+        req  = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=20)
+        if resp.status != 200:
+            return pd.DataFrame()
+        raw = resp.read()
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            name = z.namelist()[0]
+            df   = pd.read_csv(z.open(name))
+        # keep only SM-series rows
+        srs_col = next((c for c in df.columns if "SctySrs" in c or "Series" in c), None)
+        if srs_col:
+            df = df[df[srs_col].astype(str).str.strip().str.upper() == "SM"].copy()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _build_sme_ohlcv(n_days: int = 60) -> dict[str, pd.DataFrame]:
+    """
+    Download the last n_days of NSE bhavcopy files and build a per-symbol
+    OHLCV DataFrame (Date-indexed) for every SME stock found.
+    Returns {symbol: DataFrame} where DataFrame has columns Open/High/Low/Close/Volume.
+    """
+    dates  = _nse_bhavcopy_dates(n_days)
+    pieces: list[pd.DataFrame] = []
+
+    for ds in dates:
+        day_df = _fetch_nse_bhavcopy_day(ds)
+        if day_df.empty:
+            continue
+
+        # --- Detect column names dynamically ---
+        cols = list(day_df.columns)
+
+        sym_col  = next((c for c in cols if c in ("TckrSymb", "FinInstrmId", "Symbol")), None)
+        date_col = next((c for c in cols if c in ("TradDt", "BizDt", "TradeDate", "Date")), None)
+        open_col = next((c for c in cols if c in ("OpnPric", "Open", "OPEN")), None)
+        high_col = next((c for c in cols if c in ("HghPric", "High", "HIGH")), None)
+        low_col  = next((c for c in cols if c in ("LwPric", "Low", "LOW")), None)
+        cls_col  = next((c for c in cols if c in ("ClsPric", "Close", "CLOSE")), None)
+        vol_col  = next((c for c in cols if c in ("TtlTradgVol", "Volume", "VOLUME", "TotTrdQty")), None)
+
+        if not all([sym_col, open_col, high_col, low_col, cls_col, vol_col]):
+            continue
+
+        piece = day_df[[sym_col, open_col, high_col, low_col, cls_col, vol_col]].copy()
+        piece.columns = ["Symbol", "Open", "High", "Low", "Close", "Volume"]
+
+        if date_col:
+            piece["Date"] = pd.to_datetime(day_df[date_col], dayfirst=False, errors="coerce")
+        else:
+            piece["Date"] = pd.Timestamp(ds)
+
+        pieces.append(piece)
+
+    if not pieces:
+        return {}
+
+    combined = pd.concat(pieces, ignore_index=True)
+    combined["Symbol"] = combined["Symbol"].astype(str).str.strip().str.upper()
+    for c in ("Open", "High", "Low", "Close"):
+        combined[c] = pd.to_numeric(combined[c], errors="coerce")
+    combined["Volume"] = pd.to_numeric(combined["Volume"], errors="coerce").fillna(0)
+    combined.dropna(subset=["Date", "Close"], inplace=True)
+    combined.sort_values(["Symbol", "Date"], inplace=True)
+
+    result: dict[str, pd.DataFrame] = {}
+    for sym, grp in combined.groupby("Symbol"):
+        g = grp.set_index("Date")[["Open", "High", "Low", "Close", "Volume"]].copy()
+        g = g[~g.index.duplicated(keep="last")]
+        result[str(sym)] = g
+
+    return result
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def scan_sme_stocks() -> pd.DataFrame:
+    """
+    Scan NSE Emerge SME stocks for trade setups.
+    Uses NSE bhavcopy (last 60 trading days) for OHLCV since yfinance
+    has insufficient history for NSE Emerge stocks.
+    """
+    universe = load_sme_universe()
+    if not universe:
+        return pd.DataFrame()
+
+    # Build OHLCV from bhavcopy
+    ohlcv_map = _build_sme_ohlcv(n_days=60)
+    if not ohlcv_map:
+        return pd.DataFrame()
+
+    # Map bhavcopy symbols → universe metadata
+    # universe keys are NSE symbols (upper-case), bhavcopy symbols match
+    sym_to_meta: dict[str, dict] = {}
+    for key, meta in universe.items():
+        sym = meta["symbol"].upper()
+        sym_to_meta[sym] = meta
+
+    rows = []
+    for sym, df in ohlcv_map.items():
+        try:
+            df = df.copy()
+            df.dropna(subset=["Close"], inplace=True)
+            if len(df) < 20:
+                continue
+
+            close  = df["Close"]
+            high   = df["High"]
+            low    = df["Low"]
+
+            ema9   = close.ewm(span=9,   adjust=False).mean()
+            ema21  = close.ewm(span=21,  adjust=False).mean()
+            ema50  = close.ewm(span=50,  adjust=False).mean()
+
+            prev_c = close.shift(1)
+            tr     = pd.concat([high-low, (high-prev_c).abs(), (low-prev_c).abs()], axis=1).max(axis=1)
+            atr_s  = tr.ewm(com=13, min_periods=14).mean()
+
+            delta  = close.diff()
+            avg_g  = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
+            avg_l  = (-delta).clip(lower=0).ewm(com=13, min_periods=14).mean()
+            rsi_s  = 100 - (100 / (1 + avg_g / avg_l.replace(0, np.nan)))
+
+            up_move  = high - high.shift(1)
+            dn_move  = low.shift(1) - low
+            plus_dm  = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
+            minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
+            atr14    = tr.ewm(com=13, min_periods=14).mean()
+            plus_di  = 100 * pd.Series(plus_dm,  index=df.index).ewm(com=13, min_periods=14).mean() / atr14.replace(0, np.nan)
+            minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(com=13, min_periods=14).mean() / atr14.replace(0, np.nan)
+            dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+            adx_s    = dx.ewm(com=13, min_periods=14).mean()
+
+            # Supertrend
+            hl2     = (high + low) / 2
+            b_upper = (hl2 + 3.0 * atr_s).values
+            b_lower = (hl2 - 3.0 * atr_s).values
+            c_arr   = close.values
+            n       = len(df)
+            f_upper = b_upper.copy(); f_lower = b_lower.copy()
+            for _i in range(1, n):
+                if np.isnan(atr_s.iloc[_i]): continue
+                f_upper[_i] = b_upper[_i] if (np.isnan(f_upper[_i-1]) or b_upper[_i] < f_upper[_i-1] or c_arr[_i-1] > f_upper[_i-1]) else f_upper[_i-1]
+                f_lower[_i] = b_lower[_i] if (np.isnan(f_lower[_i-1]) or b_lower[_i] > f_lower[_i-1] or c_arr[_i-1] < f_lower[_i-1]) else f_lower[_i-1]
+            st_dir = np.zeros(n, dtype=int)
+            for _i in range(1, n):
+                if np.isnan(f_upper[_i]) or np.isnan(f_lower[_i]): continue
+                pd_ = st_dir[_i-1]
+                if pd_ == 0:   st_dir[_i] = 1 if c_arr[_i] >= (f_upper[_i]+f_lower[_i])/2 else -1
+                elif pd_ == 1: st_dir[_i] = -1 if c_arr[_i] < f_lower[_i] else 1
+                else:          st_dir[_i] =  1 if c_arr[_i] > f_upper[_i] else -1
+
+            lc      = float(close.iloc[-1])
+            pc      = float(close.iloc[-2]) if n >= 2 else lc
+            e9      = float(ema9.iloc[-1])
+            e21     = float(ema21.iloc[-1])
+            e50     = float(ema50.iloc[-1])
+            rsi     = float(rsi_s.iloc[-1])
+            adx     = float(adx_s.iloc[-1])
+            pdi     = float(plus_di.iloc[-1])
+            mdi     = float(minus_di.iloc[-1])
+            st      = int(st_dir[-1])
+            atr_val = float(atr_s.iloc[-1])
+            avg_vol = float(df["Volume"].iloc[-20:].mean())
+            vol_ratio = round(float(df["Volume"].iloc[-1]) / avg_vol, 1) if avg_vol > 0 else 0
+            chg     = (lc - pc) / pc * 100 if pc else 0
+
+            if any(np.isnan(v) for v in (rsi, adx, e9, e21)):
+                continue
+
+            # SME-specific liquidity guard — skip if avg daily volume < 5,000 shares
+            if avg_vol < 5000:
+                continue
+
+            # Signal
+            if e9 > e21 > e50 and lc > e21 and st == 1 and pdi > mdi:
+                direction = "BUY"
+            elif e9 < e21 < e50 and lc < e21 and st == -1 and mdi > pdi:
+                direction = "SELL"
+            else:
+                direction = "WATCH"
+
+            # Score
+            score = 0
+            if adx > 35:    score += 25
+            elif adx > 25:  score += 18
+            elif adx > 20:  score += 8
+            if direction == "BUY"  and st ==  1: score += 20
+            if direction == "SELL" and st == -1: score += 20
+            if direction == "WATCH": score += 5
+            if e9 > e21 > e50: score += 15
+            elif e9 < e21 < e50: score += 15
+            if vol_ratio >= 2.0:   score += 15
+            elif vol_ratio >= 1.5: score += 10
+            elif vol_ratio >= 1.0: score += 5
+            if 45 <= rsi <= 65:    score += 10
+            elif 35 <= rsi <= 70:  score += 5
+            if direction == "BUY"  and lc > e21: score += 10
+            if direction == "SELL" and lc < e21: score += 10
+
+            # SL / Target
+            sl     = round(lc - 1.5 * atr_val, 2) if direction == "BUY"  else (round(lc + 1.5 * atr_val, 2) if direction == "SELL" else None)
+            target = round(lc + 3.0 * atr_val, 2) if direction == "BUY"  else (round(lc - 3.0 * atr_val, 2) if direction == "SELL" else None)
+
+            # Liquidity rating
+            if avg_vol >= 100_000:   liquidity = "🟢 High"
+            elif avg_vol >= 20_000:  liquidity = "🟡 Medium"
+            else:                    liquidity = "🔴 Low"
+
+            # Metadata from universe (optional enrichment)
+            s_meta = sym_to_meta.get(sym, {})
+            name   = s_meta.get("name", sym)
+
+            rows.append({
+                "Symbol":     sym,
+                "Name":       name,
+                "Signal":     direction,
+                "Score":      score,
+                "Price (₹)":  round(lc, 2),
+                "Day Chg %":  round(chg, 2),
+                "ADX":        round(adx, 1),
+                "RSI":        round(rsi, 1),
+                "Vol Ratio":  vol_ratio,
+                "Avg Vol":    int(avg_vol),
+                "Liquidity":  liquidity,
+                "Stop (₹)":   sl,
+                "Target (₹)": target,
+                "ATR":        round(atr_val, 2),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df_out = pd.DataFrame(rows)
+    df_out.sort_values(["Score", "ADX"], ascending=[False, False], inplace=True)
+    df_out.reset_index(drop=True, inplace=True)
+    return df_out
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_sentiment() -> dict:
     """
@@ -1021,10 +1292,30 @@ def fetch_market_sentiment() -> dict:
 
 @st.cache_data(ttl=86400, show_spinner="Loading stock universe…")
 def load_universe() -> dict:
+    """Mainboard stocks only — SME excluded (insufficient yfinance history for charting)."""
     stocks = get_universe()
     result = {}
     for s in stocks:
+        if s.cap == "sme":
+            continue   # SME stocks live in the SME tab only; yfinance coverage is too thin to chart
         label = f"{s.symbol}  —  {s.name}  ({s.exchange})"
+        result[label] = {
+            "symbol": s.symbol, "name": s.name,
+            "exchange": s.exchange, "cap": s.cap,
+            "yf_ticker": s.yf_ticker,
+        }
+    return result
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_sme_universe() -> dict:
+    """SME-only universe for the SME tab."""
+    stocks = get_universe()
+    result = {}
+    for s in stocks:
+        if s.cap != "sme":
+            continue
+        label = f"{s.symbol}  —  {s.name}  (NSE Emerge)"
         result[label] = {
             "symbol": s.symbol, "name": s.name,
             "exchange": s.exchange, "cap": s.cap,
@@ -1060,17 +1351,25 @@ _CACHE_VERSION = "v5"   # bump this to invalidate all cached OHLCV on next deplo
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_ohlcv(yf_ticker: str, interval: str, period: str,
                 _v: str = _CACHE_VERSION) -> pd.DataFrame | None:
-    for attempt in range(3):
-        try:
-            df = yf.download(yf_ticker, period=period, interval=interval,
-                             progress=False, auto_adjust=True)
-            df = _flatten_yf(df)
-            df = df.dropna()
-            if not df.empty and len(df) >= 20:
-                return df
-        except Exception:
-            pass
-        time.sleep(1)
+    # Build list of tickers to try. For NSE stocks that failed, also try the
+    # SME suffix (-SM.NS) in case the universe cache has a stale plain ticker.
+    candidates = [yf_ticker]
+    if yf_ticker.endswith(".NS") and "-SM" not in yf_ticker:
+        base = yf_ticker[:-3]  # strip ".NS"
+        candidates.append(f"{base}-SM.NS")
+
+    for ticker in candidates:
+        for attempt in range(3):
+            try:
+                df = yf.download(ticker, period=period, interval=interval,
+                                 progress=False, auto_adjust=True)
+                df = _flatten_yf(df)
+                df = df.dropna()
+                if not df.empty and len(df) >= 20:
+                    return df
+            except Exception:
+                pass
+            time.sleep(1)
     return None
 
 
@@ -1809,8 +2108,9 @@ with st.sidebar:
 
 
 # ─── Top-level tab layout ─────────────────────────────────────────────────────
-tab_chart, tab_scan, tab_sentiment, tab_portfolio, tab_pullback = st.tabs([
-    "📊  Live Chart", "🎯  Trade Opportunities", "🌡️  Market Sentiment", "📋  My Portfolio", "🔁  Pullback Scanner"
+tab_chart, tab_scan, tab_sentiment, tab_portfolio, tab_pullback, tab_sme = st.tabs([
+    "📊  Live Chart", "🎯  Trade Opportunities", "🌡️  Market Sentiment",
+    "📋  My Portfolio", "🔁  Pullback Scanner", "🏭  SME Stocks"
 ])
 
 
@@ -3808,6 +4108,188 @@ Too shallow (<3%) may just be noise. Too deep (>20%) risks a trend break.
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# TAB 6 — SME STOCKS (NSE Emerge)
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_sme:
+    st.markdown("### 🏭 SME Stocks — NSE Emerge")
+    st.caption(
+        "Scans NSE Emerge (SME) listed stocks for trade setups. "
+        "SME stocks are smaller companies — always check liquidity before trading."
+    )
+
+    st.html("""
+    <div style="background:#fff8e1; border-left:4px solid #f59e0b; border-radius:6px;
+                padding:10px 16px; margin-bottom:12px; font-size:0.82rem; color:#555;">
+      ⚠️  <b>SME stocks carry higher risk</b> — lower liquidity, wider spreads, and
+      limited analyst coverage. Only trade stocks with <b>Liquidity: 🟡 Medium or 🟢 High</b>.
+      Always use a stop loss and size positions smaller than mainboard trades.
+    </div>
+    """)
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    sme_f1, sme_f2, sme_f3, sme_f4 = st.columns(4)
+    with sme_f1:
+        sme_signal = st.multiselect(
+            "Signal", ["BUY", "SELL", "WATCH"],
+            default=["BUY", "SELL"],
+            key="sme_signal",
+        )
+    with sme_f2:
+        sme_min_score = st.slider("Min Score", 0, 100, 40, 5, key="sme_min_score")
+    with sme_f3:
+        sme_min_adx = st.slider("Min ADX", 0, 40, 18, 1, key="sme_min_adx")
+    with sme_f4:
+        sme_liquidity = st.multiselect(
+            "Liquidity",
+            ["🟢 High", "🟡 Medium", "🔴 Low"],
+            default=["🟢 High", "🟡 Medium"],
+            key="sme_liq",
+            help="Filter by average daily volume. High ≥ 1L shares · Medium ≥ 20K",
+        )
+
+    sc1, sc2 = st.columns([1, 4])
+    with sc1:
+        sme_do_scan = st.button("🔍 Scan Now", type="primary", key="sme_scan_btn")
+    with sc2:
+        st.caption("Scans NSE Emerge SME universe · ~1–2 min")
+
+    if sme_do_scan:
+        scan_sme_stocks.clear()
+        _build_sme_ohlcv.clear()
+        _fetch_nse_bhavcopy_day.clear()
+        st.session_state["sme_scan_done"] = True
+
+    if not st.session_state.get("sme_scan_done"):
+        st.info("👆 Click **Scan Now** to scan NSE Emerge SME stocks.")
+    else:
+        with st.spinner("Scanning SME universe…"):
+            df_sme = scan_sme_stocks()
+
+        if df_sme.empty:
+            st.warning(
+                "No SME stocks found. The NSE bhavcopy data may not be available yet for today — "
+                "markets are open Mon–Fri; try again after 4 PM IST, or click **Scan Now** to retry."
+            )
+        else:
+            # Apply filters
+            filt_sme = df_sme[
+                (df_sme["Signal"].isin(sme_signal)) &
+                (df_sme["Score"]  >= sme_min_score) &
+                (df_sme["ADX"]    >= sme_min_adx)
+            ].copy()
+            if sme_liquidity:
+                filt_sme = filt_sme[filt_sme["Liquidity"].isin(sme_liquidity)]
+
+            # Summary
+            n_buy   = len(df_sme[df_sme["Signal"] == "BUY"])
+            n_sell  = len(df_sme[df_sme["Signal"] == "SELL"])
+            n_high  = len(df_sme[df_sme["Liquidity"] == "🟢 High"])
+            n_med   = len(df_sme[df_sme["Liquidity"] == "🟡 Medium"])
+            n_hq    = len(df_sme[df_sme["Score"] >= 70])
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Total SME Setups", len(df_sme))
+            m2.metric("BUY",  n_buy)
+            m3.metric("SELL", n_sell)
+            m4.metric("High Liquidity",   n_high)
+            m5.metric("High Quality (≥70)", n_hq)
+
+            st.markdown(f"**{len(filt_sme)} match filters** · {len(df_sme)} total SME setups found")
+
+            if filt_sme.empty:
+                st.info("No SME stocks match current filters. Try lowering Min Score or including Low liquidity.")
+            else:
+                def _sme_style(df):
+                    def row_style(row):
+                        sig = str(row.get("Signal", ""))
+                        if sig == "BUY":  return ["background-color:#e8f5ec"] * len(row)
+                        if sig == "SELL": return ["background-color:#fdecea"] * len(row)
+                        return ["background-color:#fff8e1"] * len(row)
+
+                    def sig_style(val):
+                        if val == "BUY":  return "color:#1a7a3c; font-weight:700"
+                        if val == "SELL": return "color:#c0392b; font-weight:700"
+                        return "color:#b8860b"
+
+                    def score_style(val):
+                        if not isinstance(val, (int, float)): return ""
+                        if val >= 70: return "color:#1a7a3c; font-weight:700"
+                        if val >= 50: return "color:#b8860b; font-weight:600"
+                        return "color:#888"
+
+                    def liq_style(val):
+                        v = str(val)
+                        if "High"   in v: return "color:#1a7a3c; font-weight:700"
+                        if "Medium" in v: return "color:#b8860b; font-weight:600"
+                        return "color:#c0392b; font-weight:600"
+
+                    def chg_style(val):
+                        if not isinstance(val, float): return ""
+                        return "color:#1a7a3c; font-weight:600" if val > 0 else "color:#c0392b; font-weight:600"
+
+                    cols = df.columns.tolist()
+                    style = (df.style
+                               .apply(row_style, axis=1)
+                               .applymap(sig_style,   subset=["Signal"])
+                               .applymap(score_style, subset=["Score"])
+                               .applymap(chg_style,   subset=["Day Chg %"]))
+                    if "Liquidity" in cols: style = style.applymap(liq_style, subset=["Liquidity"])
+                    return style.format({
+                        "Price (₹)":  "₹{:,.2f}",
+                        "Stop (₹)":   lambda v: f"₹{v:,.2f}" if v else "—",
+                        "Target (₹)": lambda v: f"₹{v:,.2f}" if v else "—",
+                        "Day Chg %":  "{:+.2f}%",
+                        "Vol Ratio":  "{:.1f}×",
+                        "Avg Vol":    lambda v: f"{int(v):,}",
+                        "ADX":        "{:.1f}",
+                        "RSI":        "{:.1f}",
+                    })
+
+                _sme_cols = [
+                    "Symbol", "Name", "Signal", "Score",
+                    "Price (₹)", "Day Chg %",
+                    "Liquidity", "Avg Vol", "Vol Ratio",
+                    "ADX", "RSI",
+                    "Stop (₹)", "Target (₹)", "ATR",
+                ]
+                _sme_dc = [c for c in _sme_cols if c in filt_sme.columns]
+                df_sme_disp = filt_sme[_sme_dc].reset_index(drop=True)
+
+                st.dataframe(
+                    _sme_style(df_sme_disp),
+                    hide_index=True,
+                    width="stretch",
+                    height=min(700, 65 + len(df_sme_disp) * 38),
+                )
+
+                with st.expander("📖 SME trading tips", expanded=False):
+                    st.markdown("""
+**Liquidity matters most in SME stocks:**
+- 🟢 **High** (≥ 1 lakh shares/day) — tradeable with normal lot sizes
+- 🟡 **Medium** (≥ 20K shares/day) — trade with smaller quantities, expect wider spreads
+- 🔴 **Low** (< 20K shares/day) — avoid or use very small sizes; getting out can be difficult
+
+**Key differences from mainboard stocks:**
+- Circuit limits are 5% instead of 20% — hits upper/lower circuit more frequently
+- No F&O — only cash market, so you need full capital upfront for buying
+- Market Maker obligation ends after 3 years of listing — older SME stocks may be illiquid
+- Quarterly results may be less audited — always check promoter background
+
+**Recommended position size:** 50% of your normal mainboard trade size for the same setup.
+                    """)
+
+                st.download_button(
+                    "⬇ Download CSV",
+                    data=filt_sme[_sme_dc].to_csv(index=False).encode("utf-8"),
+                    file_name=f"sme_setups_{date.today()}.csv",
+                    mime="text/csv",
+                    key="sme_dl",
+                )
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # TAB 4 — MY PORTFOLIO
 # ════════════════════════════════════════════════════════════════════════════
+
 
