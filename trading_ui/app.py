@@ -952,7 +952,8 @@ def _build_sme_ohlcv(n_days: int = 60) -> dict[str, pd.DataFrame]:
         # --- Detect column names dynamically ---
         cols = list(day_df.columns)
 
-        sym_col  = next((c for c in cols if c in ("TckrSymb", "FinInstrmId", "Symbol")), None)
+        sym_col  = next((c for c in cols if c in ("TckrSymb", "Symbol")), None) or \
+                   next((c for c in cols if c == "FinInstrmId"), None)
         date_col = next((c for c in cols if c in ("TradDt", "BizDt", "TradeDate", "Date")), None)
         open_col = next((c for c in cols if c in ("OpnPric", "Open", "OPEN")), None)
         high_col = next((c for c in cols if c in ("HghPric", "High", "HIGH")), None)
