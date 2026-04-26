@@ -32,10 +32,16 @@ os.chdir(ROOT)
 
 # ── App definitions ───────────────────────────────────────────────────────────
 APPS = {
-    "📊  Live Trading UI": {
+    "📊  India Trading UI": {
         "script": os.path.join(ROOT, "trading_ui", "app.py"),
         "port":   8501,
-        "desc":   "Live chart, signals, backtest and options chain",
+        "desc":   "NSE/BSE live chart, signals, trade setups and options chain",
+        "mode":   "streamlit",
+    },
+    "🇺🇸  US Trading UI": {
+        "script": os.path.join(ROOT, "trading_ui_us", "app.py"),
+        "port":   8503,
+        "desc":   "NYSE/NASDAQ live chart, signals, trade setups and options chain",
         "mode":   "streamlit",
     },
     "🔎  Stock Screener": {
@@ -249,7 +255,7 @@ def build_ui(root: tk.Tk):
 
 def main():
     root = tk.Tk()
-    root.geometry("520x420")
+    root.geometry("520x500")
     build_ui(root)
     root.protocol("WM_DELETE_WINDOW", lambda: (stop_all(), root.destroy()))
     root.mainloop()

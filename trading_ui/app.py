@@ -5,7 +5,7 @@ Run with:
     streamlit run trading_ui/app.py
 """
 
-import os, re, sys, warnings, logging, calendar
+import os, re, sys, warnings, logging, calendar, json, uuid
 from datetime import date, timedelta
 warnings.filterwarnings("ignore")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -23,6 +23,26 @@ from trading_ui.indicators import compute_all
 from trading_ui.signals import compute_signals
 from trading_ui.support_resistance import pivot_points, swing_levels, fibonacci_levels
 from trading_ui.charts import build_chart
+
+
+# ─── Portfolio persistence ─────────────────────────────────────────────────────
+_PORTFOLIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.json")
+
+def _load_portfolio() -> list[dict]:
+    try:
+        if os.path.exists(_PORTFOLIO_FILE):
+            with open(_PORTFOLIO_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+def _save_portfolio(trades: list[dict]):
+    try:
+        with open(_PORTFOLIO_FILE, "w") as f:
+            json.dump(trades, f, indent=2, default=str)
+    except Exception:
+        pass
 
 
 # ─── Cached heavy-computation wrappers ────────────────────────────────────────
@@ -407,7 +427,7 @@ def scan_tradeable_stocks(include_microcap: bool = False) -> pd.DataFrame:
         try:
             chunk = yf.download(
                 batch,
-                period="3mo",
+                period="6mo",
                 interval="1d",
                 progress=False,
                 auto_adjust=True,
@@ -420,7 +440,7 @@ def scan_tradeable_stocks(include_microcap: bool = False) -> pd.DataFrame:
             try:
                 chunk = yf.download(
                     batch,
-                    period="3mo",
+                    period="6mo",
                     interval="1d",
                     progress=False,
                     auto_adjust=True,
@@ -451,7 +471,7 @@ def scan_tradeable_stocks(include_microcap: bool = False) -> pd.DataFrame:
                     continue
 
                 df.dropna(how="all", inplace=True)
-                if len(df) < 60:
+                if len(df) < 30:
                     continue
 
                 # ── Compute indicators inline (fast, no full compute_all) ────
@@ -578,21 +598,66 @@ def scan_tradeable_stocks(include_microcap: bool = False) -> pd.DataFrame:
                 else:
                     sl = target = None
 
+                # ── Trading execution type ───────────────────────────────────
+                # Classified by current market microstructure, not stock fundamentals.
+                # Priority: most specific condition first.
+                atr_pct   = atr_val / last_close * 100 if last_close > 0 else 0
+                _full_bull = last_e9 > last_e21 > last_e50 > last_e200
+                _full_bear = last_e9 < last_e21 < last_e50 < last_e200
+                _ema_align = last_e9 > last_e21 > last_e50 or last_e9 < last_e21 < last_e50
+
+                # Reversal: RSI at extremes — price likely to mean-revert
+                if (direction == "BUY" and last_rsi < 36) or (direction == "SELL" and last_rsi > 74):
+                    trade_type = "Reversal Trading"
+
+                # Breakout: surge in volume + price above EMA9 + strong RSI
+                elif vol_ratio >= 2.5 and last_rsi >= 58 and last_close > last_e9:
+                    trade_type = "Breakout Trading"
+
+                # Momentum: strong vol, overbought-ish RSI, powerful trend
+                elif vol_ratio >= 1.8 and last_rsi >= 60 and last_adx > 28 and _ema_align:
+                    trade_type = "Momentum Trading"
+
+                # Scalping: ATR% very wide — risk moves too fast for multi-day holds
+                elif atr_pct > 4.5:
+                    trade_type = "Scalping"
+
+                # Long-term Investing: full EMA stack, low volatility, mild trend
+                elif (_full_bull or _full_bear) and atr_pct < 1.5 and last_adx < 22 and 45 <= last_rsi <= 60:
+                    trade_type = "Long-term Investing"
+
+                # Positional Trading: full EMA stack, strong trend, multi-week hold
+                elif (_full_bull or _full_bear) and last_adx >= 22 and 42 <= last_rsi <= 68:
+                    trade_type = "Positional Trading"
+
+                # Swing Trading: partial EMA alignment, moderate trend and RSI
+                elif _ema_align and 18 <= last_adx <= 42 and 38 <= last_rsi <= 67:
+                    trade_type = "Swing Trading"
+
+                # Intraday Trading: ADX too low for multi-day, or trend unclear
+                elif last_adx < 18 or not _ema_align:
+                    trade_type = "Intraday Trading"
+
+                # Algorithmic Trading: very tight ATR, no clear trend edge — only algo benefits
+                else:
+                    trade_type = "Algorithmic Trading"
+
                 s = meta[ticker]
                 rows.append({
-                    "Symbol":      s["symbol"],
-                    "Name":        s["name"],
-                    "Cap":         s["cap"].upper(),
-                    "Signal":      direction,
-                    "Score":       score,
-                    "Price (₹)":   round(last_close, 2),
-                    "Day Chg %":   round(chg_pct, 2),
-                    "ADX":         round(last_adx, 1),
-                    "RSI":         round(last_rsi, 1),
-                    "Vol Ratio":   vol_ratio,
-                    "Stop (₹)":    sl,
-                    "Target (₹)":  target,
-                    "ATR":         round(atr_val, 2),
+                    "Symbol":    s["symbol"],
+                    "Name":      s["name"],
+                    "Cap":       s["cap"].upper(),
+                    "Type":      trade_type,
+                    "Signal":    direction,
+                    "Score":     score,
+                    "Price (₹)": round(last_close, 2),
+                    "Day Chg %": round(chg_pct, 2),
+                    "ADX":       round(last_adx, 1),
+                    "RSI":       round(last_rsi, 1),
+                    "Vol Ratio": vol_ratio,
+                    "Stop (₹)":  sl,
+                    "Target (₹)":target,
+                    "ATR":       round(atr_val, 2),
                 })
             except Exception:
                 continue
@@ -605,6 +670,222 @@ def scan_tradeable_stocks(include_microcap: bool = False) -> pd.DataFrame:
     df_out.reset_index(drop=True, inplace=True)
     return df_out
 
+
+# ─── Pullback Scanner ──────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800, show_spinner=False)
+def scan_pullback_stocks(include_microcap: bool = False) -> pd.DataFrame:
+    """
+    Finds stocks in confirmed uptrends that have pulled back into a buy zone.
+
+    Entry rules (all must be true):
+      1. Trend intact     — EMA9 > EMA21 > EMA50 AND Supertrend = +1
+      2. Pulled back      — price dipped below EMA21 or EMA9 within last 5 bars,
+                            OR current price is within 3% above EMA21
+      3. Pullback depth   — between 3% and 25% from the 20-bar high
+      4. RSI cooling off  — RSI between 35 and 62 (not overbought)
+      5. ADX trend        — ADX ≥ 18 (some trend strength, not choppy)
+
+    Stage column:
+      "Near EMA9"  — price within 1 ATR above EMA9  (tightest, aggressive entry)
+      "Near EMA21" — price within 1 ATR above EMA21 (standard)
+      "Deep"       — pulled back >10% from 20d high but structure intact (higher risk)
+    """
+    universe = load_universe()
+    if include_microcap:
+        stocks = {k: v for k, v in universe.items() if v.get("exchange") in ("NSE", "BSE")}
+    else:
+        stocks = {k: v for k, v in universe.items()
+                  if v.get("cap", "").lower() in ("largecap", "midcap", "smallcap")
+                  and v.get("exchange") in ("NSE", "BSE")}
+
+    tickers = list({v["yf_ticker"] for v in stocks.values()})
+    meta    = {v["yf_ticker"]: v for v in stocks.values()}
+
+    BATCH = 60
+    frames = []
+    for i in range(0, len(tickers), BATCH):
+        batch = tickers[i:i+BATCH]
+        try:
+            chunk = yf.download(batch, period="6mo", interval="1d",
+                                progress=False, auto_adjust=True,
+                                group_by="ticker", threads=False)
+            frames.append((batch, chunk))
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+
+    def _extract(raw, ticker):
+        if isinstance(raw.columns, pd.MultiIndex):
+            if ticker not in raw.columns.get_level_values(0):
+                return None
+            return raw[ticker].copy()
+        return raw.copy()
+
+    rows = []
+    for batch_tickers, raw in frames:
+        for ticker in batch_tickers:
+            try:
+                df = _extract(raw, ticker)
+                if df is None:
+                    continue
+                df.dropna(how="all", inplace=True)
+                if len(df) < 50:
+                    continue
+
+                close  = df["Close"]
+                high   = df["High"]
+                low    = df["Low"]
+
+                ema9   = close.ewm(span=9,   adjust=False).mean()
+                ema21  = close.ewm(span=21,  adjust=False).mean()
+                ema50  = close.ewm(span=50,  adjust=False).mean()
+                ema200 = close.ewm(span=200, adjust=False).mean()
+
+                prev_c = close.shift(1)
+                tr     = pd.concat([high-low, (high-prev_c).abs(), (low-prev_c).abs()], axis=1).max(axis=1)
+                atr_s  = tr.ewm(com=13, min_periods=14).mean()
+
+                delta  = close.diff()
+                avg_g  = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
+                avg_l  = (-delta).clip(lower=0).ewm(com=13, min_periods=14).mean()
+                rsi_s  = 100 - (100 / (1 + avg_g / avg_l.replace(0, np.nan)))
+
+                up_move  = high - high.shift(1)
+                dn_move  = low.shift(1) - low
+                plus_dm  = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
+                minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
+                atr14    = tr.ewm(com=13, min_periods=14).mean()
+                plus_di  = 100 * pd.Series(plus_dm,  index=df.index).ewm(com=13, min_periods=14).mean() / atr14.replace(0, np.nan)
+                minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(com=13, min_periods=14).mean() / atr14.replace(0, np.nan)
+                dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+                adx_s    = dx.ewm(com=13, min_periods=14).mean()
+
+                # Supertrend
+                hl2     = (high + low) / 2
+                b_upper = (hl2 + 3.0 * atr_s).values
+                b_lower = (hl2 - 3.0 * atr_s).values
+                c_arr   = close.values
+                n       = len(df)
+                f_upper = b_upper.copy(); f_lower = b_lower.copy()
+                for i in range(1, n):
+                    if np.isnan(atr_s.iloc[i]): continue
+                    f_upper[i] = b_upper[i] if (np.isnan(f_upper[i-1]) or b_upper[i] < f_upper[i-1] or c_arr[i-1] > f_upper[i-1]) else f_upper[i-1]
+                    f_lower[i] = b_lower[i] if (np.isnan(f_lower[i-1]) or b_lower[i] > f_lower[i-1] or c_arr[i-1] < f_lower[i-1]) else f_lower[i-1]
+                st_dir = np.zeros(n, dtype=int)
+                for i in range(1, n):
+                    if np.isnan(f_upper[i]) or np.isnan(f_lower[i]): continue
+                    pd_ = st_dir[i-1]
+                    if pd_ == 0:   st_dir[i] = 1 if c_arr[i] >= (f_upper[i]+f_lower[i])/2 else -1
+                    elif pd_ == 1: st_dir[i] = -1 if c_arr[i] < f_lower[i] else 1
+                    else:          st_dir[i] =  1 if c_arr[i] > f_upper[i] else -1
+
+                lc      = float(close.iloc[-1])
+                e9      = float(ema9.iloc[-1])
+                e21     = float(ema21.iloc[-1])
+                e50     = float(ema50.iloc[-1])
+                e200    = float(ema200.iloc[-1])
+                rsi     = float(rsi_s.iloc[-1])
+                adx     = float(adx_s.iloc[-1])
+                atr_val = float(atr_s.iloc[-1])
+                st      = int(st_dir[-1])
+                prev_c_val = float(close.iloc[-2]) if n >= 2 else lc
+                chg     = (lc - prev_c_val) / prev_c_val * 100 if prev_c_val else 0
+                avg_vol = float(df["Volume"].iloc[-20:].mean())
+                vol_ratio = round(float(df["Volume"].iloc[-1]) / avg_vol, 1) if avg_vol > 0 else 0
+
+                if any(np.isnan(v) for v in (rsi, adx, e9, e21, e50, atr_val)):
+                    continue
+
+                # ── Rule 1: Uptrend intact ───────────────────────────────────
+                uptrend = e9 > e21 > e50 and st == 1
+
+                if not uptrend:
+                    continue
+
+                # ── Rule 2: RSI and ADX ──────────────────────────────────────
+                if not (35 <= rsi <= 62):
+                    continue
+                if adx < 18:
+                    continue
+
+                # ── Rule 3: Pullback depth from 20-bar high ──────────────────
+                high_20d     = float(high.iloc[-20:].max())
+                pullback_pct = (high_20d - lc) / high_20d * 100 if high_20d > 0 else 0.0
+
+                if not (3.0 <= pullback_pct <= 25.0):
+                    continue
+
+                # ── Rule 4: Price in buy zone — near EMA9 or EMA21 ──────────
+                near_ema9  = lc <= e9  + 1.0 * atr_val and lc >= e9  - 0.5 * atr_val
+                near_ema21 = lc <= e21 + 1.0 * atr_val and lc >= e21 - 0.5 * atr_val
+
+                # Also accept: touched EMA21 within last 5 bars
+                touched_ema21_recent = any(
+                    float(close.iloc[j]) <= float(ema21.iloc[j]) * 1.005
+                    for j in range(-5, 0) if abs(j) <= n
+                )
+
+                if not (near_ema9 or near_ema21 or touched_ema21_recent):
+                    continue
+
+                # ── Stage label ──────────────────────────────────────────────
+                if near_ema9:
+                    stage = "🟢 Near EMA9"
+                elif near_ema21 or touched_ema21_recent:
+                    stage = "🟡 Near EMA21"
+                else:
+                    stage = "🔵 Deep"
+
+                # ── Pullback quality score ───────────────────────────────────
+                pb_score = 0
+                if e9 > e21 > e50 > e200:   pb_score += 30   # full bull stack
+                elif e9 > e21 > e50:         pb_score += 20
+                if adx > 30:                 pb_score += 20
+                elif adx > 20:               pb_score += 12
+                if 40 <= rsi <= 55:          pb_score += 20   # RSI cooling, not washed out
+                elif 35 <= rsi <= 60:        pb_score += 10
+                if near_ema9:                pb_score += 15   # tighter entry = higher quality
+                elif near_ema21:             pb_score += 10
+                if 5.0 <= pullback_pct <= 12.0: pb_score += 15  # sweet spot depth
+                elif pullback_pct <= 5.0:       pb_score += 8
+
+                # ── SL / Target ──────────────────────────────────────────────
+                sl     = round(e21 - 1.0 * atr_val, 2)   # below EMA21 by 1 ATR
+                target = round(lc  + 3.0 * atr_val, 2)   # 3R target
+
+                s = meta[ticker]
+                rows.append({
+                    "Symbol":       s["symbol"],
+                    "Name":         s["name"],
+                    "Cap":          s.get("cap", "").upper(),
+                    "Stage":        stage,
+                    "PB Score":     pb_score,
+                    "Price (₹)":    round(lc, 2),
+                    "Day Chg %":    round(chg, 2),
+                    "Pullback %":   round(pullback_pct, 1),
+                    "EMA9":         round(e9, 2),
+                    "EMA21":        round(e21, 2),
+                    "EMA50":        round(e50, 2),
+                    "RSI":          round(rsi, 1),
+                    "ADX":          round(adx, 1),
+                    "Vol Ratio":    vol_ratio,
+                    "Stop (₹)":     sl,
+                    "Target (₹)":   target,
+                    "ATR":          round(atr_val, 2),
+                    "_yf_ticker":   ticker,
+                })
+            except Exception:
+                continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df_out = pd.DataFrame(rows)
+    df_out.sort_values(["PB Score", "Pullback %"], ascending=[False, True], inplace=True)
+    df_out.reset_index(drop=True, inplace=True)
+    return df_out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -752,16 +1033,20 @@ def load_universe() -> dict:
     return result
 
 
+_OHLCV = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+
 def _flatten_yf(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Newer yfinance (0.2.50+) returns a MultiIndex columns DataFrame even
-    for single-ticker downloads. Flatten it to plain Open/High/Low/Close/Volume.
+    Flatten MultiIndex columns that yfinance 0.2.50+ returns for single-ticker
+    downloads. Detects which level holds the OHLCV names and keeps that one.
     """
     if isinstance(df.columns, pd.MultiIndex):
-        # Level 0 = price type (Close/High/...), level 1 = ticker symbol
-        df = df.droplevel(level=1, axis=1)
-        # After droplevel there may be duplicate column names if somehow
-        # multiple tickers slipped in — keep only the first occurrence
+        # Find which level contains OHLCV names
+        lvl = 0
+        if len(set(df.columns.get_level_values(0)) & _OHLCV) < \
+           len(set(df.columns.get_level_values(1)) & _OHLCV):
+            lvl = 1
+        df.columns = df.columns.get_level_values(lvl)
         df = df.loc[:, ~df.columns.duplicated()]
     # Ensure every column is a plain 1-D Series
     for col in list(df.columns):
@@ -770,16 +1055,23 @@ def _flatten_yf(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_CACHE_VERSION = "v5"   # bump this to invalidate all cached OHLCV on next deploy
+
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_ohlcv(yf_ticker: str, interval: str, period: str) -> pd.DataFrame | None:
-    try:
-        df = yf.download(yf_ticker, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
-        df = _flatten_yf(df)
-        df = df.dropna()
-        return df if not df.empty and len(df) >= 20 else None
-    except Exception:
-        return None
+def fetch_ohlcv(yf_ticker: str, interval: str, period: str,
+                _v: str = _CACHE_VERSION) -> pd.DataFrame | None:
+    for attempt in range(3):
+        try:
+            df = yf.download(yf_ticker, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            df = _flatten_yf(df)
+            df = df.dropna()
+            if not df.empty and len(df) >= 20:
+                return df
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -788,6 +1080,16 @@ def fetch_info(yf_ticker: str) -> dict:
         return yf.Ticker(yf_ticker).info or {}
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_day_range(yf_ticker: str) -> tuple[float, float] | None:
+    """Return (day_high, day_low) using fast_info — live, unadjusted."""
+    try:
+        fi = yf.Ticker(yf_ticker).fast_info
+        return float(fi.day_high), float(fi.day_low)
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -800,6 +1102,41 @@ def fetch_spot_price(yf_ticker: str) -> float | None:
         return float(df["Close"].dropna().iloc[-1]) if not df.empty else None
     except Exception:
         return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_stock_signal(yf_ticker: str) -> dict:
+    """
+    Fetch OHLCV, compute indicators, return bias + score + key values.
+    Used by the portfolio tab to show live signal per holding.
+    """
+    try:
+        df = yf.download(yf_ticker, period="2y", interval="1d",
+                         progress=False, auto_adjust=True)
+        df = _flatten_yf(df).dropna()
+        if len(df) < 30:
+            return {"bias": "N/A", "score": 0, "rsi": None, "adx": None,
+                    "atr": None, "last_price": None, "error": "Not enough data"}
+        df_e = compute_all(df)
+        sig  = compute_signals(df_e)
+        last = df_e.iloc[-1]
+        fi   = yf.Ticker(yf_ticker).fast_info
+        lp   = float(fi.last_price) if fi and fi.last_price else float(last["Close"])
+        return {
+            "bias":        sig["current_bias"],
+            "score":       round(sig["strength_score"], 1),
+            "regime":      sig.get("regime", "MIXED"),
+            "rsi":         round(float(last["rsi"]),  1) if "rsi"  in df_e.columns else None,
+            "adx":         round(float(last["adx"]),  1) if "adx"  in df_e.columns else None,
+            "atr":         round(float(last["atr"]),  2) if "atr"  in df_e.columns else None,
+            "ema21":       round(float(last["ema_21"]), 2) if "ema_21" in df_e.columns else None,
+            "ema50":       round(float(last["ema_50"]), 2) if "ema_50" in df_e.columns else None,
+            "last_price":  lp,
+            "error":       None,
+        }
+    except Exception as e:
+        return {"bias": "N/A", "score": 0, "rsi": None, "adx": None,
+                "atr": None, "last_price": None, "error": str(e)}
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -1433,7 +1770,7 @@ with st.sidebar:
     st.html("<hr class='thin-divider'>")
 
     st.markdown("**Timeframe**")
-    timeframe   = st.select_slider("", options=list(TIMEFRAMES.keys()), value="1D",
+    timeframe   = st.select_slider("Timeframe", options=list(TIMEFRAMES.keys()), value="1D",
                                     label_visibility="collapsed")
     tf          = TIMEFRAMES[timeframe]
     period_bars = st.slider("Bars", 50, tf["max_bars"], min(200, tf["max_bars"]),
@@ -1466,79 +1803,550 @@ with st.sidebar:
     sr_fib   = st.checkbox("Fibonacci",          value=timeframe in ("1D", "1W"))
 
     st.html("<hr class='thin-divider'>")
-    if st.button("🔄  Refresh live data", type="primary", use_container_width=True):
+    if st.button("🔄  Refresh live data", type="primary", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
 
-# ─── Guard ────────────────────────────────────────────────────────────────────
-
-if stock is None:
-    st.info("👈  Select an instrument to get started.")
-    st.stop()
-
-itype = _detect_itype(stock["yf_ticker"])
-
-with st.spinner(f"Loading {stock['symbol']}…"):
-    df_raw  = fetch_ohlcv(stock["yf_ticker"], tf["interval"], tf["period"])
-    info    = fetch_info(stock["yf_ticker"])
-
-# ── F&O fallback: NSE F&O OHLCV is not on Yahoo Finance → use spot index ──────
-_fno_fallback_used = False
-if df_raw is None and itype in ("futures", "options"):
-    ul = stock.get("underlying", "")
-    if ul in _FNO_UNDERLYINGS:
-        spot_ticker = _FNO_UNDERLYINGS[ul]["spot_ticker"]
-        df_raw = fetch_ohlcv(spot_ticker, tf["interval"], tf["period"])
-        if df_raw is not None:
-            _fno_fallback_used = True
-
-if df_raw is None:
-    st.error(f"No data for **{stock['symbol']}** ({timeframe}). "
-             "Try a different timeframe or check the symbol.")
-    st.stop()
-
-df_raw = df_raw.tail(period_bars).copy()
-
-# Core calculations — all wrapped in @st.cache_data so sidebar interactions
-# (search typing, timeframe toggle) don't re-run expensive computations.
-df_enriched   = _cached_compute_all(df_raw,
-                                    use_supertrend=ind_supertrend,
-                                    use_donchian=ind_donchian)
-signal_result = _cached_compute_signals(
-    df_enriched,
-    lookback=period_bars,
-    use_candlestick=ind_candle,
-    use_volume=ind_volume,
-)
-bias          = signal_result["current_bias"]
-score         = signal_result["strength_score"]
-signals       = signal_result["signals"]
-regime        = signal_result.get("regime", "MIXED")
-
-sr_levels = _cached_sr_levels(df_enriched, sr_pivot, sr_swing, sr_fib)
-
-last_close = float(df_raw["Close"].iloc[-1])
-prev_close = float(df_raw["Close"].iloc[-2]) if len(df_raw) > 1 else last_close
-change_abs = last_close - prev_close
-change_pct = change_abs / prev_close * 100 if prev_close else 0.0
-volume     = int(df_raw["Volume"].iloc[-1])
-
-# Day high/low: always use the daily candle so intraday TFs show the real range
-_df_daily  = fetch_ohlcv(stock["yf_ticker"], "1d", "5d")
-if _df_daily is not None and len(_df_daily) >= 1:
-    day_high = float(_df_daily["High"].iloc[-1])
-    day_low  = float(_df_daily["Low"].iloc[-1])
-else:
-    day_high = float(df_raw["High"].max())
-    day_low  = float(df_raw["Low"].min())
-
-is_up = change_pct >= 0
-
 # ─── Top-level tab layout ─────────────────────────────────────────────────────
-tab_chart, tab_scan, tab_sentiment = st.tabs(["📊  Live Chart", "🎯  Trade Opportunities", "🌡️  Market Sentiment"])
+tab_chart, tab_scan, tab_sentiment, tab_portfolio, tab_pullback = st.tabs([
+    "📊  Live Chart", "🎯  Trade Opportunities", "🌡️  Market Sentiment", "📋  My Portfolio", "🔁  Pullback Scanner"
+])
+
+
+with tab_portfolio:
+    st.markdown("### 📋 My Portfolio")
+    st.caption("Track your Zerodha trades — live P&L, current signal, and risk status for each position.")
+
+    # ── Load / initialise portfolio from disk ─────────────────────────────────
+    if "portfolio_trades" not in st.session_state:
+        st.session_state["portfolio_trades"] = _load_portfolio()
+
+    trades: list[dict] = st.session_state["portfolio_trades"]
+
+    # ── Capital input ─────────────────────────────────────────────────────────
+    with st.expander("💼  Capital Settings", expanded=False):
+        cap_col1, cap_col2 = st.columns([1, 3])
+        with cap_col1:
+            pf_capital = st.number_input(
+                "Total Capital in Market (₹)",
+                min_value=0.0, step=1000.0, format="%.0f",
+                value=float(st.session_state.get("pf_capital", 0.0)),
+                key="pf_capital",
+                help="Total cash you have put into the market (across all open positions).",
+            )
+        with cap_col2:
+            st.caption(
+                "Enter the total amount you have deployed. "
+                "This is used to show return % on capital and how much of your money is working."
+            )
+
+    # ── Add new trade form ────────────────────────────────────────────────────
+    with st.expander("➕  Add New Trade", expanded=len(trades) == 0):
+        universe_for_portfolio = load_universe()
+        _pf_labels = sorted([
+            k for k, v in universe_for_portfolio.items()
+            if v.get("exchange") in ("NSE", "BSE")
+        ])
+
+        pf1, pf2, pf3 = st.columns(3)
+        with pf1:
+            pf_label = st.selectbox(
+                "Stock / Index",
+                options=[""] + _pf_labels,
+                format_func=lambda x: "Search…" if x == "" else x,
+                key="pf_add_label",
+            )
+        with pf2:
+            pf_direction = st.selectbox("Direction", ["BUY", "SELL"], key="pf_add_dir")
+        with pf3:
+            pf_entry = st.number_input("Entry Price (₹)", min_value=0.01, value=100.0,
+                                       step=0.05, format="%.2f", key="pf_add_entry")
+
+        pf4, pf5, pf6 = st.columns(3)
+        with pf4:
+            pf_qty = st.number_input("Quantity (shares)", min_value=1, value=10,
+                                     step=1, key="pf_add_qty")
+        with pf5:
+            pf_sl = st.number_input("Stop Loss (₹)  [optional, 0 = ATR-based]",
+                                    min_value=0.0, value=0.0, step=0.05, format="%.2f",
+                                    key="pf_add_sl")
+        with pf6:
+            pf_target = st.number_input("Target (₹)  [optional, 0 = ATR-based]",
+                                        min_value=0.0, value=0.0, step=0.05, format="%.2f",
+                                        key="pf_add_target")
+
+        pf7, pf8 = st.columns([1, 2])
+        with pf7:
+            pf_exit = st.number_input(
+                "Exit Price (₹)  [0 = still open]",
+                min_value=0.0, value=0.0, step=0.05, format="%.2f",
+                key="pf_add_exit",
+                help="If you already closed this trade, enter the price you exited at. Leave 0 if still open.",
+            )
+        with pf8:
+            pf_notes = st.text_input("Notes (optional)", placeholder="e.g. Breakout above resistance",
+                                     key="pf_add_notes")
+
+        if st.button("Add to Portfolio", type="primary", key="pf_add_btn"):
+            if pf_label and pf_entry > 0 and pf_qty > 0:
+                stock_meta = universe_for_portfolio.get(pf_label, {})
+                new_trade = {
+                    "id":          str(uuid.uuid4())[:8],
+                    "symbol":      stock_meta.get("symbol", pf_label.split("  —  ")[0]),
+                    "name":        stock_meta.get("name", ""),
+                    "yf_ticker":   stock_meta.get("yf_ticker", ""),
+                    "exchange":    stock_meta.get("exchange", "NSE"),
+                    "direction":   pf_direction,
+                    "entry_price": round(pf_entry, 2),
+                    "qty":         int(pf_qty),
+                    "stop_loss":   round(pf_sl, 2) if pf_sl > 0 else None,
+                    "target":      round(pf_target, 2) if pf_target > 0 else None,
+                    "exit_price":  round(pf_exit, 2) if pf_exit > 0 else None,
+                    "entry_date":  str(date.today()),
+                    "notes":       pf_notes.strip(),
+                }
+                trades.append(new_trade)
+                st.session_state["portfolio_trades"] = trades
+                _save_portfolio(trades)
+                st.success(f"Added {new_trade['symbol']} {pf_direction} @ ₹{pf_entry:,.2f} × {pf_qty}")
+                st.rerun()
+            else:
+                st.warning("Select a stock and enter a valid entry price and quantity.")
+
+    if not trades:
+        st.info("No trades yet. Click **Add New Trade** above to log your first position.")
+
+    if trades:
+        col_ref, col_del = st.columns([5, 1])
+        with col_ref:
+            if st.button("🔄  Refresh signals", key="pf_refresh"):
+                st.cache_data.clear()
+        with col_del:
+            _pf_clear = st.button("🗑 Clear All", key="pf_clear_all",
+                                  help="Remove all trades from portfolio")
+        if _pf_clear:
+            st.session_state["portfolio_trades"] = []
+            _save_portfolio([])
+            st.rerun()
+
+        _signal_cache: dict = {}
+        with st.spinner("Fetching live prices and signals…"):
+            for t in trades:
+                tk = t.get("yf_ticker", "")
+                if tk and tk not in _signal_cache:
+                    _signal_cache[tk] = fetch_stock_signal(tk)
+
+        # ── Build portfolio rows ──────────────────────────────────────────────────
+        pf_rows = []
+        for t in trades:
+            sig = _signal_cache.get(t.get("yf_ticker", ""), {})
+            lp  = sig.get("last_price") or t["entry_price"]
+            atr = sig.get("atr") or 0
+
+            entry      = t["entry_price"]
+            qty        = t["qty"]
+            is_buy     = t["direction"] == "BUY"
+            exit_price = t.get("exit_price")          # None = still open
+            is_closed  = exit_price is not None and exit_price > 0
+
+            # Price used for P&L: exit price if closed, else live price
+            price_for_pnl = exit_price if is_closed else lp
+
+            # P&L
+            pnl_per = (price_for_pnl - entry) if is_buy else (entry - price_for_pnl)
+            pnl_inr = round(pnl_per * qty, 2)
+            pnl_pct = round(pnl_per / entry * 100, 2) if entry else 0
+
+            # Stop loss: user-defined first, fallback to 1.5×ATR (only meaningful for open trades)
+            sl = t.get("stop_loss")
+            if not sl and atr and not is_closed:
+                sl = round(entry - 1.5 * atr, 2) if is_buy else round(entry + 1.5 * atr, 2)
+
+            # Target: user-defined first, fallback to 3×ATR
+            tgt = t.get("target")
+            if not tgt and atr and not is_closed:
+                tgt = round(entry + 3.0 * atr, 2) if is_buy else round(entry - 3.0 * atr, 2)
+
+            # Risk assessment (only relevant for open trades)
+            risk_per_share = abs(entry - sl) if (sl and not is_closed) else None
+            risk_inr       = round(risk_per_share * qty, 2) if risk_per_share else None
+            reward         = abs(tgt - entry) if (tgt and not is_closed) else None
+            rr             = round(reward / risk_per_share, 1) if (reward and risk_per_share) else None
+
+            # Status
+            if is_closed:
+                if pnl_inr > 0:  status = f"✅ Closed +{pnl_pct:.1f}%"
+                elif pnl_inr < 0: status = f"❌ Closed {pnl_pct:.1f}%"
+                else:             status = "✅ Closed Break-even"
+            elif sl and tgt:
+                if is_buy:
+                    if lp <= sl:              status = "🔴 STOP HIT"
+                    elif lp >= tgt:           status = "🎯 TARGET HIT"
+                    elif lp > entry * 1.005:  status = "🟢 In Profit"
+                    elif lp < entry * 0.995:  status = "🟡 Below Entry"
+                    else:                      status = "⚪ Near Entry"
+                else:
+                    if lp >= sl:              status = "🔴 STOP HIT"
+                    elif lp <= tgt:           status = "🎯 TARGET HIT"
+                    elif lp < entry * 0.995:  status = "🟢 In Profit"
+                    elif lp > entry * 1.005:  status = "🟡 Below Entry"
+                    else:                      status = "⚪ Near Entry"
+            else:
+                status = "🟢 Profit" if pnl_inr > 0 else ("🔴 Loss" if pnl_inr < 0 else "⚪ Flat")
+
+            # Signal alignment (suppressed for closed trades)
+            bias = sig.get("bias", "N/A")
+            if is_closed:
+                signal_align = "✅ Closed"
+            elif bias == "N/A":
+                signal_align = "—"
+            elif (is_buy and bias == "BULLISH") or (not is_buy and bias == "BEARISH"):
+                signal_align = "✅ Aligned"
+            elif (is_buy and bias == "BEARISH"):
+                # BUY trade but signal turned bearish — always a risk
+                signal_align = "⚠️ Against"
+            elif (not is_buy and bias == "BULLISH"):
+                # SELL (short) trade but signal is bullish.
+                # If the trade is essentially flat (±0.5% of entry) it's likely an exit
+                # record rather than an intentional short — don't fire a warning.
+                if abs(pnl_pct) <= 0.5:
+                    signal_align = "🟡 Neutral"
+                elif pnl_inr > 0:
+                    # Short is in profit but trend is against — advise caution
+                    signal_align = "🟡 Risky (trend vs you)"
+                else:
+                    # Short is losing AND trend is bullish — real risk
+                    signal_align = "⚠️ Against"
+            else:
+                signal_align = "🟡 Neutral"
+
+            pf_rows.append({
+                "Symbol":        t["symbol"],
+                "Direction":     t["direction"],
+                "Date":          t["entry_date"],
+                "Entry (₹)":     entry,
+                "Exit (₹)":      exit_price if is_closed else None,
+                "Qty":           qty,
+                "Current (₹)":   round(exit_price, 2) if is_closed else round(lp, 2),
+                "P&L (₹)":       pnl_inr,
+                "P&L %":         pnl_pct,
+                "Stop (₹)":      sl if not is_closed else None,
+                "Target (₹)":    tgt if not is_closed else None,
+                "Risk (₹)":      risk_inr,
+                "R:R":           rr,
+                "Signal":        bias,
+                "Alignment":     signal_align,
+                "RSI":           sig.get("rsi"),
+                "ADX":           sig.get("adx"),
+                "Status":        status,
+                "Notes":         t.get("notes", ""),
+                "_id":           t["id"],
+                "_closed":       is_closed,
+            })
+
+        df_pf = pd.DataFrame(pf_rows)
+
+        # ── Portfolio summary header ──────────────────────────────────────────────
+        open_rows   = [r for r in pf_rows if not r["_closed"]]
+        closed_rows = [r for r in pf_rows if r["_closed"]]
+
+        realized_pnl   = sum(r["P&L (₹)"] for r in closed_rows)
+        unrealized_pnl = sum(r["P&L (₹)"] for r in open_rows)
+        total_pnl      = realized_pnl + unrealized_pnl
+
+        open_invested  = sum(r["Entry (₹)"] * r["Qty"] for r in open_rows)
+        open_current   = sum(r["Current (₹)"] * r["Qty"] for r in open_rows)
+        total_risk     = sum(r["Risk (₹)"] for r in open_rows if r["Risk (₹)"])
+
+        n_profit       = sum(1 for r in pf_rows if r["P&L (₹)"] > 0)
+        n_loss         = sum(1 for r in pf_rows if r["P&L (₹)"] < 0)
+        n_stop_hit     = sum(1 for r in open_rows if "STOP HIT" in r["Status"])
+        n_target_hit   = sum(1 for r in open_rows if "TARGET HIT" in r["Status"])
+
+        capital        = st.session_state.get("pf_capital", 0.0)
+        cap_return_pct = total_pnl / capital * 100 if capital > 0 else None
+
+        pnl_color  = "#1a7a3c" if total_pnl >= 0 else "#c0392b"
+        pnl_arrow  = "▲" if total_pnl >= 0 else "▼"
+        r_color    = "#1a7a3c" if realized_pnl >= 0 else "#c0392b"
+        u_color    = "#1a7a3c" if unrealized_pnl >= 0 else "#c0392b"
+
+        cap_html = ""
+        if capital > 0:
+            deployed_pct = open_invested / capital * 100
+            cap_html = f"""
+          <div style="border-left:1px solid #dee2e6; padding-left:24px;">
+            <div style="font-size:0.75rem; color:#888;">Capital</div>
+            <div style="font-size:1.1rem; font-weight:600;">₹{capital:,.0f}</div>
+            <div style="font-size:0.75rem; color:#888;">{deployed_pct:.0f}% deployed</div>
+          </div>
+          <div style="border-left:1px solid #dee2e6; padding-left:24px;">
+            <div style="font-size:0.75rem; color:#888;">Return on Capital</div>
+            <div style="font-size:1.3rem; font-weight:700; color:{pnl_color};">{cap_return_pct:+.2f}%</div>
+          </div>"""
+
+        st.html(f"""
+        <div style="background:#f8f9fa; border-radius:10px; padding:16px 20px; margin-bottom:8px;
+                    display:flex; gap:28px; flex-wrap:wrap; align-items:flex-start;">
+          <div>
+            <div style="font-size:0.75rem; color:#888; text-transform:uppercase; letter-spacing:.05em;">Total P&L</div>
+            <div style="font-size:1.8rem; font-weight:700; color:{pnl_color};">
+              {pnl_arrow} ₹{abs(total_pnl):,.2f}
+            </div>
+          </div>
+          <div style="border-left:1px solid #dee2e6; padding-left:24px;">
+            <div style="font-size:0.75rem; color:#888;">Realized (closed)</div>
+            <div style="font-size:1.2rem; font-weight:700; color:{r_color};">{'+' if realized_pnl >= 0 else ''}₹{realized_pnl:,.2f}</div>
+            <div style="font-size:0.72rem; color:#aaa;">{len(closed_rows)} trades closed</div>
+          </div>
+          <div style="border-left:1px solid #dee2e6; padding-left:24px;">
+            <div style="font-size:0.75rem; color:#888;">Unrealized (open)</div>
+            <div style="font-size:1.2rem; font-weight:700; color:{u_color};">{'+' if unrealized_pnl >= 0 else ''}₹{unrealized_pnl:,.2f}</div>
+            <div style="font-size:0.72rem; color:#aaa;">₹{open_invested:,.0f} → ₹{open_current:,.0f}</div>
+          </div>
+          <div style="border-left:1px solid #dee2e6; padding-left:24px;">
+            <div style="font-size:0.75rem; color:#888;">Open Risk</div>
+            <div style="font-size:1.1rem; font-weight:600; color:#c0392b;">₹{total_risk:,.0f}</div>
+          </div>
+          <div style="border-left:1px solid #dee2e6; padding-left:24px;">
+            <div style="font-size:0.75rem; color:#888;">Positions</div>
+            <div style="font-size:0.9rem; line-height:1.6;">
+              <span style="color:#1a7a3c;">🟢 {n_profit} winning</span> &nbsp;
+              <span style="color:#c0392b;">🔴 {n_loss} losing</span>
+              {'<br><span style="color:#c0392b; font-weight:700">⚠️ ' + str(n_stop_hit) + ' stop hit</span>' if n_stop_hit else ''}
+              {'<br><span style="color:#1a7a3c; font-weight:700">🎯 ' + str(n_target_hit) + ' target hit</span>' if n_target_hit else ''}
+            </div>
+          </div>
+          {cap_html}
+        </div>
+        """)
+
+        # ── Per-position table ────────────────────────────────────────────────────
+        def _pf_style(df):
+            def row_style(row):
+                s = str(row.get("Status", ""))
+                if "STOP HIT"   in s: return ["background-color:#fdecea"] * len(row)
+                if "TARGET HIT" in s: return ["background-color:#e8f5ec"] * len(row)
+                if "Profit"     in s or "In Profit" in s: return ["background-color:#f0faf4"] * len(row)
+                return [""] * len(row)
+
+            def pnl_style(val):
+                if not isinstance(val, (int, float)): return ""
+                return "color:#1a7a3c; font-weight:700" if val > 0 else ("color:#c0392b; font-weight:700" if val < 0 else "")
+
+            def dir_style(val):
+                return "color:#1a7a3c; font-weight:700" if val == "BUY" else "color:#c0392b; font-weight:700"
+
+            def sig_style(val):
+                if val == "BULLISH": return "color:#1a7a3c; font-weight:600"
+                if val == "BEARISH": return "color:#c0392b; font-weight:600"
+                return "color:#b8860b"
+
+            def align_style(val):
+                if "Aligned" in str(val): return "color:#1a7a3c; font-weight:600"
+                if "Against" in str(val): return "color:#c0392b; font-weight:700"
+                return "color:#b8860b"
+
+            def rr_style(val):
+                if not isinstance(val, (int, float)): return ""
+                if val >= 3.0: return "color:#1a7a3c; font-weight:700"
+                if val >= 2.0: return "color:#b8860b"
+                return "color:#c0392b"
+
+            cols = df.columns.tolist()
+            style = (df.style
+                       .apply(row_style, axis=1)
+                       .applymap(dir_style,   subset=["Direction"])
+                       .applymap(pnl_style,   subset=["P&L (₹)", "P&L %"])
+                       .applymap(sig_style,   subset=["Signal"]))
+            if "Alignment" in cols: style = style.applymap(align_style, subset=["Alignment"])
+            if "R:R"       in cols: style = style.applymap(rr_style,    subset=["R:R"])
+            return style.format({
+                "Entry (₹)":    "₹{:,.2f}",
+                "Exit (₹)":     lambda v: f"₹{v:,.2f}" if v else "—",
+                "Current (₹)":  "₹{:,.2f}",
+                "P&L (₹)":      lambda v: f"₹{v:+,.2f}",
+                "P&L %":        "{:+.2f}%",
+                "Stop (₹)":     lambda v: f"₹{v:,.2f}" if v else "—",
+                "Target (₹)":   lambda v: f"₹{v:,.2f}" if v else "—",
+                "Risk (₹)":     lambda v: f"₹{v:,.0f}" if v else "—",
+                "R:R":          lambda v: f"1:{v:.1f}" if v else "—",
+                "RSI":          lambda v: f"{v:.1f}" if v else "—",
+                "ADX":          lambda v: f"{v:.1f}" if v else "—",
+            })
+
+        _display_pf_cols = [
+            "Symbol", "Direction", "Date", "Entry (₹)", "Exit (₹)", "Qty", "Current (₹)",
+            "P&L (₹)", "P&L %", "Stop (₹)", "Target (₹)", "Risk (₹)", "R:R",
+            "Signal", "Alignment", "RSI", "ADX", "Status", "Notes",
+        ]
+        _dc_pf = [c for c in _display_pf_cols if c in df_pf.columns]
+        df_pf_display = df_pf[_dc_pf].copy()
+
+        st.dataframe(
+            _pf_style(df_pf_display),
+            hide_index=True,
+            width="stretch",
+            height=min(800, 65 + len(df_pf_display) * 42),
+        )
+
+        # ── Close / Remove trades ─────────────────────────────────────────────────
+        st.html("<hr class='thin-divider'>")
+        _open_rows   = [r for r in pf_rows if not r["_closed"]]
+        _closed_rows = [r for r in pf_rows if r["_closed"]]
+
+        cl1, cl2 = st.columns(2)
+
+        with cl1:
+            st.markdown("**Close a position (record exit)**")
+            _close_options = {
+                f"{r['Symbol']} {r['Direction']} @ ₹{r['Entry (₹)']} ({r['Date']})  [{r['_id']}]": r["_id"]
+                for r in _open_rows
+            }
+            if _close_options:
+                _close_label = st.selectbox("Select open trade to close",
+                                             [""] + list(_close_options.keys()),
+                                             key="pf_close_sel")
+                _close_exit = st.number_input("Exit Price (₹)", min_value=0.01, value=100.0,
+                                              step=0.05, format="%.2f", key="pf_close_price")
+                if st.button("✅ Mark as Closed", type="primary", key="pf_close_btn") and _close_label:
+                    _cid = _close_options[_close_label]
+                    for t in trades:
+                        if t["id"] == _cid:
+                            t["exit_price"] = round(_close_exit, 2)
+                    st.session_state["portfolio_trades"] = trades
+                    _save_portfolio(trades)
+                    st.rerun()
+            else:
+                st.caption("No open positions to close.")
+
+        with cl2:
+            st.markdown("**Remove a position**")
+            _remove_options = {
+                f"{r['Symbol']} {r['Direction']} @ ₹{r['Entry (₹)']} ({r['Date']})  [{r['_id']}]": r["_id"]
+                for r in pf_rows
+            }
+            _remove_label = st.selectbox("Select trade to remove", [""] + list(_remove_options.keys()),
+                                          key="pf_remove_sel")
+            if st.button("🗑 Remove selected trade", key="pf_remove_btn") and _remove_label:
+                _rid = _remove_options[_remove_label]
+                trades = [t for t in trades if t["id"] != _rid]
+                st.session_state["portfolio_trades"] = trades
+                _save_portfolio(trades)
+                st.rerun()
+
+        # ── Risk alerts (open positions only) ────────────────────────────────────
+        _alerts = [r for r in pf_rows if not r["_closed"] and
+                   ("STOP HIT" in r["Status"] or "Against" in r["Alignment"] or "Risky" in r["Alignment"])]
+        if _alerts:
+            st.html("<hr class='thin-divider'>")
+            st.markdown("#### ⚠️ Risk Alerts")
+            for r in _alerts:
+                if "STOP HIT" in r["Status"]:
+                    st.error(
+                        f"**{r['Symbol']}** {r['Direction']} — Stop loss hit! "
+                        f"Current ₹{r['Current (₹)']:,.2f} vs Stop ₹{r['Stop (₹)']:,.2f} · "
+                        f"P&L: ₹{r['P&L (₹)']:+,.2f} ({r['P&L %']:+.2f}%)"
+                    )
+                elif "Against" in r["Alignment"]:
+                    st.warning(
+                        f"**{r['Symbol']}** {r['Direction']} — Signal turned **{r['Signal']}** "
+                        f"(against your {r['Direction']} position). "
+                        f"P&L: ₹{r['P&L (₹)']:+,.2f} ({r['P&L %']:+.2f}%) · "
+                        f"RSI: {r['RSI']}  ADX: {r['ADX']}"
+                    )
+                elif "Risky" in r["Alignment"]:
+                    st.info(
+                        f"**{r['Symbol']}** SELL (short) — market signal is **BULLISH** but trade is in profit. "
+                        f"P&L: ₹{r['P&L (₹)']:+,.2f} ({r['P&L %']:+.2f}%) · "
+                        f"Consider taking profit — trend is working against you."
+                    )
 
 with tab_chart:
+
+    if stock is None:
+        st.info("👈  Select an instrument from the sidebar to get started.")
+
+if stock is not None:
+  with tab_chart:
+    itype = _detect_itype(stock["yf_ticker"])
+
+    with st.spinner(f"Loading {stock['symbol']}…"):
+        df_raw  = fetch_ohlcv(stock["yf_ticker"], tf["interval"], tf["period"])
+        info    = fetch_info(stock["yf_ticker"])
+
+    # ── F&O fallback: NSE F&O OHLCV is not on Yahoo Finance → use spot index ─
+    _fno_fallback_used = False
+    if df_raw is None and itype in ("futures", "options"):
+        ul = stock.get("underlying", "")
+        if ul in _FNO_UNDERLYINGS:
+            spot_ticker = _FNO_UNDERLYINGS[ul]["spot_ticker"]
+            df_raw = fetch_ohlcv(spot_ticker, tf["interval"], tf["period"])
+            if df_raw is not None:
+                _fno_fallback_used = True
+
+    if df_raw is None:
+        st.error(f"No data for **{stock['symbol']}** ({timeframe}). "
+                 "Try a different timeframe or check the symbol.")
+        st.stop()
+
+    df_raw = df_raw.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+
+    # Compute indicators on the FULL fetched history so EMA(200), ADX, Supertrend etc.
+    # have enough bars to converge accurately.  Trim to period_bars for display AFTER.
+    df_enriched_full = _cached_compute_all(df_raw,
+                                           use_supertrend=ind_supertrend,
+                                           use_donchian=ind_donchian)
+    df_enriched = df_enriched_full.tail(period_bars).copy()
+
+    signal_result = _cached_compute_signals(
+        df_enriched,
+        lookback=period_bars,
+        use_candlestick=ind_candle,
+        use_volume=ind_volume,
+    )
+    bias          = signal_result["current_bias"]
+    score         = signal_result["strength_score"]
+    signals       = signal_result["signals"]
+    regime        = signal_result.get("regime", "MIXED")
+
+    sr_levels = _cached_sr_levels(df_enriched, sr_pivot, sr_swing, sr_fib)
+
+    # Always use fast_info for live price display — never rely on cached OHLCV for this
+    # For BSE stocks, try NSE ticker first (more liquid, more reliable live feed)
+    def _get_fast_info(yf_ticker: str):
+        candidates = [yf_ticker]
+        if yf_ticker.endswith(".BO"):
+            candidates.insert(0, yf_ticker.replace(".BO", ".NS"))
+        for t in candidates:
+            try:
+                fi = yf.Ticker(t).fast_info
+                if fi and fi.last_price:
+                    return fi
+            except Exception:
+                pass
+        return None
+
+    _fi_live = _get_fast_info(stock["yf_ticker"])
+
+    if _fi_live and _fi_live.last_price:
+        last_close = float(_fi_live.last_price)
+        prev_close = float(_fi_live.regular_market_previous_close) if _fi_live.regular_market_previous_close else last_close
+        day_high   = float(_fi_live.day_high) if _fi_live.day_high else last_close
+        day_low    = float(_fi_live.day_low)  if _fi_live.day_low  else last_close
+    else:
+        last_close = float(df_raw["Close"].iloc[-1])
+        prev_close = float(df_raw["Close"].iloc[-2]) if len(df_raw) > 1 else last_close
+        day_high   = float(df_raw["High"].max())
+        day_low    = float(df_raw["Low"].min())
+
+    change_abs = last_close - prev_close
+    change_pct = change_abs / prev_close * 100 if prev_close else 0.0
+    volume     = int(df_raw["Volume"].iloc[-1])
+
+    is_up = change_pct >= 0
+
 
     # ════════════════════════════════════════════════════════════════════════════
     # SECTION 1 — STOCK HEADER
@@ -1558,6 +2366,7 @@ with tab_chart:
         <div style="text-align:right;">
           <p class="header-price">{pfx}{last_close:,.2f}</p>
           <p class="{chg_cls}">{chg_arrow} {abs(change_pct):.2f}%&nbsp;&nbsp;{change_abs:+.2f}</p>
+          <p style="font-size:0.7rem; color:#aaa; margin:0;">Last traded price · NSE official close may differ slightly</p>
         </div>
       </div>
     </div>
@@ -1654,10 +2463,10 @@ with tab_chart:
                 c1, c2 = st.columns(2)
                 with c1:
                     st.markdown("**Calls (CE)**")
-                    st.dataframe(_oc_style(ce_df, "CE"), use_container_width=True, height=380)
+                    st.dataframe(_oc_style(ce_df, "CE"), width="stretch", height=380)
                 with c2:
                     st.markdown("**Puts (PE)**")
-                    st.dataframe(_oc_style(pe_df, "PE"), use_container_width=True, height=380)
+                    st.dataframe(_oc_style(pe_df, "PE"), width="stretch", height=380)
 
 
     # ════════════════════════════════════════════════════════════════════════════
@@ -1734,7 +2543,7 @@ with tab_chart:
     st.html('<div class="chart-wrapper">')
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         config={
             "scrollZoom": True,           # mouse-wheel zoom on the chart
             "displayModeBar": True,
@@ -1833,7 +2642,7 @@ with tab_chart:
                     style_calls = calls[c_cols].style
                     if "inTheMoney" in c_cols:
                         style_calls = style_calls.applymap(_call_style, subset=["inTheMoney"])
-                    st.dataframe(style_calls, hide_index=True, use_container_width=True, height=280)
+                    st.dataframe(style_calls, hide_index=True, width="stretch", height=280)
                 with oc2:
                     st.markdown("**Puts**")
                     def _put_style(v):
@@ -1841,7 +2650,7 @@ with tab_chart:
                     style_puts = puts[p_cols].style
                     if "inTheMoney" in p_cols:
                         style_puts = style_puts.applymap(_put_style, subset=["inTheMoney"])
-                    st.dataframe(style_puts, hide_index=True, use_container_width=True, height=280)
+                    st.dataframe(style_puts, hide_index=True, width="stretch", height=280)
 
 
     # ════════════════════════════════════════════════════════════════════════════
@@ -2047,9 +2856,9 @@ with tab_chart:
         c1, c2 = st.columns(2)
         half = len(rows) // 2
         with c1:
-            st.dataframe(pd.DataFrame(rows[:half]),  hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows[:half]),  hide_index=True, width="stretch")
         with c2:
-            st.dataframe(pd.DataFrame(rows[half:]), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows[half:]), hide_index=True, width="stretch")
 
     with st.expander("📋  All Raw Signals  —  every indicator that fired"):
         if signals:
@@ -2070,7 +2879,7 @@ with tab_chart:
                 if val == "SELL":  return "background-color:#fdecea; color:#c0392b; font-weight:bold"
                 return "background-color:#fff8e1; color:#b8860b; font-weight:bold"
             st.dataframe(sig_df.style.applymap(_sig_bg, subset=["Type"]),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
         else:
             st.info("No signals in the current window.")
 
@@ -2133,7 +2942,7 @@ with tab_chart:
                     yaxis=dict(title="Capital ₹", showgrid=True, gridcolor="#e8e8e8"),
                     showlegend=False,
                 )
-                st.plotly_chart(eq_fig, use_container_width=True,
+                st.plotly_chart(eq_fig, width="stretch",
                                 config={"displayModeBar": False})
 
                 # ── Trade log table ────────────────────────────────────────────
@@ -2153,7 +2962,7 @@ with tab_chart:
                     .apply(_bt_row_style, axis=1)
                     .applymap(_result_style, subset=["Result"])
                 )
-                st.dataframe(styled, hide_index=True, use_container_width=True)
+                st.dataframe(styled, hide_index=True, width="stretch")
 
                 # ── Download button ────────────────────────────────────────────
                 ticker_label = stock.get("label", stock.get("ticker", "backtest"))
@@ -2184,7 +2993,7 @@ with tab_chart:
                 if val == "Support":    return "color:#3fb950"
                 return "color:#bc8cff"
             st.dataframe(sr_df.style.applymap(_sr_col, subset=["Type"]),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
         else:
             st.info("No S/R levels computed. Enable options in the sidebar.")
 
@@ -2195,6 +3004,137 @@ with tab_chart:
 
 with tab_scan:
     st.markdown("### 🎯 Trade Opportunities")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # RISK MODEL — settings
+    # ════════════════════════════════════════════════════════════════════════
+    with st.expander("⚙️  Risk Model Settings", expanded=True):
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        with rc1:
+            rm_capital = st.number_input(
+                "Account Capital (₹)",
+                min_value=10_000, max_value=100_000_000,
+                value=int(st.session_state.get("rm_capital", 500_000)),
+                step=10_000, format="%d", key="rm_capital",
+                help="Total trading capital. Position sizes are calculated from this.",
+            )
+        with rc2:
+            rm_risk_pct = st.number_input(
+                "Risk per Trade (%)",
+                min_value=0.1, max_value=5.0,
+                value=float(st.session_state.get("rm_risk_pct", 1.0)),
+                step=0.1, format="%.1f", key="rm_risk_pct",
+                help="Max % of capital you are willing to lose on a single trade. "
+                     "1% is standard; 2% is aggressive.",
+            )
+        with rc3:
+            rm_max_open = st.number_input(
+                "Max Open Positions",
+                min_value=1, max_value=30,
+                value=int(st.session_state.get("rm_max_open", 8)),
+                step=1, key="rm_max_open",
+                help="Never hold more than this many positions simultaneously. "
+                     "Limits total portfolio risk exposure.",
+            )
+        with rc4:
+            rm_monthly_loss = st.number_input(
+                "Monthly Loss Limit (%)",
+                min_value=1.0, max_value=20.0,
+                value=float(st.session_state.get("rm_monthly_loss", 5.0)),
+                step=0.5, format="%.1f", key="rm_monthly_loss",
+                help="If you lose this % of capital in the current calendar month, "
+                     "stop taking new trades until next month.",
+            )
+
+        rc5, rc6, rc7, rc8 = st.columns(4)
+        with rc5:
+            rm_min_rr = st.number_input(
+                "Min R:R Ratio",
+                min_value=1.0, max_value=5.0,
+                value=float(st.session_state.get("rm_min_rr", 2.0)),
+                step=0.5, format="%.1f", key="rm_min_rr",
+                help="Only show trades where Target / Stop distance ≥ this ratio. "
+                     "2.0 means you make 2× what you risk.",
+            )
+        with rc6:
+            rm_max_sector_pct = st.number_input(
+                "Max Sector Concentration (%)",
+                min_value=10, max_value=100,
+                value=int(st.session_state.get("rm_max_sector_pct", 30)),
+                step=5, key="rm_max_sector_pct",
+                help="Flag if a single sector makes up more than this % of "
+                     "available slots. Prevents over-concentration in one sector.",
+            )
+        with rc7:
+            rm_monthly_loss_taken = st.number_input(
+                "Losses Taken This Month (₹)",
+                min_value=0, max_value=int(rm_capital),
+                value=int(st.session_state.get("rm_monthly_loss_taken", 0)),
+                step=1_000, format="%d", key="rm_monthly_loss_taken",
+                help="Enter how much you have already lost this month. "
+                     "The model will warn or block if you approach the monthly limit.",
+            )
+        with rc8:
+            rm_open_positions = st.number_input(
+                "Current Open Positions",
+                min_value=0, max_value=30,
+                value=int(st.session_state.get("rm_open_positions", 0)),
+                step=1, key="rm_open_positions",
+                help="How many positions you currently hold. Affects how many new "
+                     "trades the model allows.",
+            )
+
+    # ── Derived risk limits ───────────────────────────────────────────────────
+    _risk_per_trade_inr    = rm_capital * rm_risk_pct / 100
+    _monthly_limit_inr     = rm_capital * rm_monthly_loss / 100
+    _monthly_remaining     = max(0.0, _monthly_limit_inr - rm_monthly_loss_taken)
+    _slots_available       = max(0, rm_max_open - rm_open_positions)
+    _portfolio_risk_used   = rm_open_positions * rm_risk_pct
+    _portfolio_risk_max    = rm_max_open * rm_risk_pct
+    _monthly_loss_pct_used = rm_monthly_loss_taken / rm_capital * 100 if rm_capital else 0
+
+    # ── Portfolio health banner ───────────────────────────────────────────────
+    if _monthly_remaining <= 0:
+        _health_bg = "#fdecea"; _health_border = "#c0392b"
+        _health_msg = "🛑 MONTHLY LOSS LIMIT REACHED — No new trades this month."
+        _health_text = "#c0392b"
+        _trading_allowed = False
+    elif _monthly_loss_pct_used >= rm_monthly_loss * 0.75:
+        _health_bg = "#fff8e1"; _health_border = "#b8860b"
+        _health_msg = f"⚠️  Approaching monthly limit — ₹{_monthly_remaining:,.0f} remaining before stop."
+        _health_text = "#b8860b"
+        _trading_allowed = True
+    elif _slots_available == 0:
+        _health_bg = "#fff8e1"; _health_border = "#b8860b"
+        _health_msg = f"⚠️  Max positions reached ({rm_max_open}) — close a position before adding new ones."
+        _health_text = "#b8860b"
+        _trading_allowed = False
+    else:
+        _health_bg = "#e8f5ec"; _health_border = "#1a7a3c"
+        _health_msg = f"✅  Account healthy — {_slots_available} slot{'s' if _slots_available != 1 else ''} available for new trades."
+        _health_text = "#1a7a3c"
+        _trading_allowed = True
+
+    st.html(f"""
+    <div style="background:{_health_bg}; border-left:5px solid {_health_border};
+                border-radius:8px; padding:14px 18px; margin:8px 0 12px 0;">
+      <div style="font-size:1rem; font-weight:700; color:{_health_text}; margin-bottom:10px;">
+        {_health_msg}
+      </div>
+      <div style="display:flex; gap:32px; flex-wrap:wrap; font-size:0.82rem; color:#444;">
+        <div><b>Risk/Trade</b><br>₹{_risk_per_trade_inr:,.0f} ({rm_risk_pct}%)</div>
+        <div><b>Monthly Budget</b><br>₹{_monthly_remaining:,.0f} left of ₹{_monthly_limit_inr:,.0f}
+          &nbsp;·&nbsp; {_monthly_loss_pct_used:.1f}% used</div>
+        <div><b>Portfolio Risk</b><br>{_portfolio_risk_used:.0f}% in market · max {_portfolio_risk_max:.0f}%</div>
+        <div><b>Slots</b><br>{rm_open_positions} open · {_slots_available} available of {rm_max_open}</div>
+        <div><b>Min R:R</b><br>1 : {rm_min_rr:.1f} filter active</div>
+      </div>
+    </div>
+    """)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SCAN FILTERS
+    # ════════════════════════════════════════════════════════════════════════
     st.caption("Stocks scored on trend strength, direction clarity, volume, and momentum. Sorted by score — highest first.")
     st.html("""<div style="display:flex; gap:16px; margin-bottom:8px; font-size:0.78rem;">
       <span style="background:#e8f5ec; border-radius:4px; padding:2px 8px;">🟢 BUY — bullish setup</span>
@@ -2237,35 +3177,107 @@ with tab_scan:
         df_scan = scan_tradeable_stocks(include_microcap=scan_microcap)
 
     if df_scan.empty:
-        st.warning("No data returned. Check internet connection.")
+        st.warning("Scan returned no results. Click **🔍 Scan Now** to retry.")
+        st.caption("If this persists, try restarting the app to clear the cache.")
     else:
-        # Apply filters
+        # ── Apply scan filters ────────────────────────────────────────────────
         filtered_scan = df_scan[
             (df_scan["Signal"].isin(scan_signal)) &
             (df_scan["Score"]  >= scan_min_score) &
             (df_scan["ADX"]    >= scan_min_adx)
-        ]
+        ].copy()
         if scan_cap:
             filtered_scan = filtered_scan[filtered_scan["Cap"].isin(scan_cap)]
 
-        # Summary metrics
+        # ── Apply risk model to each row ─────────────────────────────────────
+        def _apply_risk(row):
+            price  = row["Price (₹)"]
+            sl     = row["Stop (₹)"]
+            target = row["Target (₹)"]
+
+            if sl is None or target is None or price <= 0 or sl <= 0 or target <= 0:
+                row["Risk (₹/share)"] = None
+                row["Qty"]            = None
+                row["Trade Value (₹)"]= None
+                row["R:R"]            = None
+                row["Risk Flag"]      = "—"
+                return row
+
+            risk_per_share  = abs(price - sl)
+            reward_per_share = abs(target - price)
+            rr = round(reward_per_share / risk_per_share, 1) if risk_per_share > 0 else 0
+
+            qty = int(_risk_per_trade_inr / risk_per_share) if risk_per_share > 0 else 0
+            # Cap qty so trade value doesn't exceed 20% of capital (concentration limit)
+            max_qty_by_concentration = int(rm_capital * 0.20 / price) if price > 0 else qty
+            qty = min(qty, max_qty_by_concentration)
+
+            trade_value = round(qty * price, 0)
+
+            # Risk flag
+            flags = []
+            if rr < rm_min_rr:
+                flags.append(f"R:R {rr:.1f} < {rm_min_rr:.1f}")
+            if trade_value > rm_capital * 0.20:
+                flags.append(">20% capital")
+            flag_str = " · ".join(flags) if flags else "✓ OK"
+
+            row["Risk (₹/share)"]  = round(risk_per_share, 2)
+            row["Qty"]             = qty if qty > 0 else None
+            row["Trade Value (₹)"] = trade_value if qty > 0 else None
+            row["R:R"]             = rr
+            row["Risk Flag"]       = flag_str
+            return row
+
+        filtered_scan = filtered_scan.apply(_apply_risk, axis=1)
+
+        # Remove trades that fail R:R unless user explicitly wants to see them
+        rr_failed = filtered_scan[filtered_scan["R:R"].notna() & (filtered_scan["R:R"] < rm_min_rr)]
+        filtered_scan = filtered_scan[
+            filtered_scan["R:R"].isna() | (filtered_scan["R:R"] >= rm_min_rr)
+        ]
+
+        # ── Sector concentration warning ─────────────────────────────────────
+        if not filtered_scan.empty and "Cap" in filtered_scan.columns and _slots_available > 0:
+            # Use Cap as proxy for sector grouping when sector column is absent
+            # (the scan output doesn't include a Sector column, use the name prefix heuristic)
+            top_cap = filtered_scan["Cap"].value_counts()
+            for cap_name, cap_count in top_cap.items():
+                concentration = cap_count / max(_slots_available, 1) * 100
+                if concentration > rm_max_sector_pct:
+                    st.warning(
+                        f"⚠️  **Concentration alert**: {cap_count} of {_slots_available} available "
+                        f"slots ({concentration:.0f}%) are **{cap_name}** stocks — above your "
+                        f"{rm_max_sector_pct}% limit. Consider spreading across cap segments."
+                    )
+
+        # ── Summary metrics ───────────────────────────────────────────────────
         buys   = len(df_scan[df_scan["Signal"] == "BUY"])
         sells  = len(df_scan[df_scan["Signal"] == "SELL"])
         high_q = len(df_scan[df_scan["Score"] >= 70])
         strong = len(df_scan[df_scan["ADX"] >= 30])
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("BUY Setups",      buys,   help="Bullish trend + signal")
         m2.metric("SELL Setups",     sells,  help="Bearish trend + signal")
         m3.metric("High Quality (≥70)", high_q, help="Score ≥ 70 — strongest setups")
         m4.metric("Strong Trend (ADX≥30)", strong)
+        m5.metric("Failed R:R Filter", len(rr_failed),
+                  help=f"Trades removed because R:R < {rm_min_rr:.1f}")
 
-        st.markdown(f"**{len(filtered_scan)} stocks** match · out of **{len(df_scan)}** scanned")
+        _filter_parts = [f"**{len(filtered_scan)} pass all filters**", f"{len(df_scan)} scanned"]
+        if len(rr_failed): _filter_parts.append(f"{len(rr_failed)} low R:R removed")
+        st.markdown(" · ".join(_filter_parts))
 
-        if filtered_scan.empty:
-            st.info("No stocks match. Try lowering Min Score or Min ADX.")
+        if not _trading_allowed:
+            st.error("Trading blocked by risk model. See status above.")
+        elif filtered_scan.empty:
+            st.info("No stocks match. Try lowering Min Score, Min ADX, or Min R:R ratio.")
         else:
             def _style_scan(df):
+                _rr_col  = "R:R"
+                _flag_col = "Risk Flag"
+
                 def row_style(row):
                     sig = row["Signal"]
                     if sig == "BUY":   return ["background-color:#e8f5ec"] * len(row)
@@ -2292,30 +3304,95 @@ with tab_scan:
                     if not isinstance(val, float): return ""
                     return "color:#1a7a3c; font-weight:600" if val > 0 else "color:#c0392b; font-weight:600"
 
-                return (df.style
-                        .apply(row_style, axis=1)
-                        .applymap(score_style, subset=["Score"])
-                        .applymap(sig_style,   subset=["Signal"])
-                        .applymap(adx_style,   subset=["ADX"])
-                        .applymap(chg_style,   subset=["Day Chg %"])
-                        .format({
-                            "Price (₹)":  "₹{:,.2f}",
-                            "Stop (₹)":   lambda v: f"₹{v:,.2f}" if v else "—",
-                            "Target (₹)": lambda v: f"₹{v:,.2f}" if v else "—",
-                            "Day Chg %":  "{:+.2f}%",
-                            "Vol Ratio":  "{:.1f}×",
-                            "ADX":        "{:.1f}",
-                            "RSI":        "{:.1f}",
-                        }))
+                def rr_style(val):
+                    if not isinstance(val, (int, float)): return ""
+                    if val >= 3.0: return "color:#1a7a3c; font-weight:700"
+                    if val >= 2.0: return "color:#b8860b; font-weight:600"
+                    return "color:#c0392b"
+
+                def flag_style(val):
+                    if str(val).startswith("✓"): return "color:#1a7a3c"
+                    return "color:#c0392b; font-weight:600"
+
+                def type_style(val):
+                    return {
+                        "Swing Trading":        "color:#1a7a3c; font-weight:700",
+                        "Positional Trading":   "color:#1a5aad; font-weight:700",
+                        "Momentum Trading":     "color:#7b2d8b; font-weight:700",
+                        "Breakout Trading":     "color:#e65100; font-weight:700",
+                        "Reversal Trading":     "color:#c0392b; font-weight:700",
+                        "Long-term Investing":  "color:#1a7a3c",
+                        "Intraday Trading":     "color:#b8860b; font-weight:600",
+                        "Scalping":             "color:#888",
+                        "Algorithmic Trading":  "color:#aaa",
+                    }.get(str(val), "")
+
+                fmt = {
+                    "Price (₹)":      "₹{:,.2f}",
+                    "Stop (₹)":       lambda v: f"₹{v:,.2f}" if v else "—",
+                    "Target (₹)":     lambda v: f"₹{v:,.2f}" if v else "—",
+                    "Day Chg %":      "{:+.2f}%",
+                    "Vol Ratio":      "{:.1f}×",
+                    "ADX":            "{:.1f}",
+                    "RSI":            "{:.1f}",
+                    "R:R":            lambda v: f"1:{v:.1f}" if v else "—",
+                    "Risk (₹/share)": lambda v: f"₹{v:,.2f}" if v else "—",
+                    "Qty":            lambda v: f"{int(v):,}" if v else "—",
+                    "Trade Value (₹)":lambda v: f"₹{v:,.0f}" if v else "—",
+                }
+                cols_present = [c for c in df.columns]
+                style = (df.style
+                           .apply(row_style, axis=1)
+                           .applymap(score_style, subset=["Score"])
+                           .applymap(sig_style,   subset=["Signal"])
+                           .applymap(adx_style,   subset=["ADX"])
+                           .applymap(chg_style,   subset=["Day Chg %"]))
+                if _rr_col   in cols_present: style = style.applymap(rr_style,   subset=[_rr_col])
+                if _flag_col in cols_present: style = style.applymap(flag_style, subset=[_flag_col])
+                if "Type"    in cols_present: style = style.applymap(type_style, subset=["Type"])
+                return style.format(fmt)
+
+            # Column order
+            _col_order = [
+                "Symbol", "Name", "Cap", "Type", "Signal", "Score",
+                "Price (₹)", "Day Chg %",
+                "ADX", "RSI", "Vol Ratio",
+                "R:R", "Stop (₹)", "Target (₹)",
+                "Risk (₹/share)", "Qty", "Trade Value (₹)", "Risk Flag", "ATR",
+            ]
+            _display_cols = [c for c in _col_order if c in filtered_scan.columns]
+            df_display = filtered_scan[_display_cols].reset_index(drop=True)
 
             st.dataframe(
-                _style_scan(filtered_scan.reset_index(drop=True)),
+                _style_scan(df_display),
                 hide_index=True,
-                use_container_width=True,
-                height=min(700, 65 + len(filtered_scan) * 38),
+                width="stretch",
+                height=min(700, 65 + len(df_display) * 38),
             )
 
-            csv_scan = filtered_scan.to_csv(index=False).encode("utf-8")
+            # ── Risk summary for selected trades ─────────────────────────────
+            total_trade_val = filtered_scan["Trade Value (₹)"].dropna().sum()
+            total_risk_inr  = filtered_scan.apply(
+                lambda r: (r["Risk (₹/share)"] or 0) * (r["Qty"] or 0), axis=1
+            ).sum()
+            n_valid = (filtered_scan["Qty"].notna() & (filtered_scan["Qty"] > 0)).sum()
+
+            if n_valid > 0:
+                st.html(f"""
+                <div style="background:#f0f4fc; border-radius:8px; padding:12px 18px;
+                            margin:8px 0; font-size:0.83rem; color:#333;">
+                  <b>If you took ALL {n_valid} filtered trades:</b> &nbsp;
+                  Total deployed = <b>₹{total_trade_val:,.0f}</b>
+                  ({total_trade_val/rm_capital*100:.1f}% of capital) &nbsp;·&nbsp;
+                  Total risk = <b>₹{total_risk_inr:,.0f}</b>
+                  ({total_risk_inr/rm_capital*100:.1f}% of capital) &nbsp;·&nbsp;
+                  {'<span style="color:#c0392b; font-weight:700">⚠ Exceeds monthly loss budget!</span>'
+                    if total_risk_inr > _monthly_remaining else
+                   '<span style="color:#1a7a3c; font-weight:700">✓ Within monthly budget</span>'}
+                </div>
+                """)
+
+            csv_scan = filtered_scan[_display_cols].to_csv(index=False).encode("utf-8")
             st.download_button(
                 "⬇ Download as CSV",
                 data=csv_scan,
@@ -2483,7 +3560,7 @@ with tab_sentiment:
                     .applymap(fii_col, subset=["FII Net (₹Cr)", "DII Net (₹Cr)"])
                     .format({"FII Net (₹Cr)": "{:+,.0f}", "DII Net (₹Cr)": "{:+,.0f}"}))
 
-        st.dataframe(_fii_style(df_fii), hide_index=True, use_container_width=True)
+        st.dataframe(_fii_style(df_fii), hide_index=True, width="stretch")
     else:
         st.caption("FII/DII flow data unavailable (NSE API may be rate-limited). Try refreshing.")
 
@@ -2527,6 +3604,210 @@ with tab_sentiment:
                 legend=dict(orientation="h", y=1.02, x=0),
                 showlegend=True,
             )
-            st.plotly_chart(fig_n, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig_n, width="stretch", config={"displayModeBar": False})
     except Exception:
         st.info("Nifty chart unavailable.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 5 — PULLBACK SCANNER
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_pullback:
+    st.markdown("### 🔁 Pullback Scanner")
+    st.caption(
+        "Finds NSE/BSE stocks in confirmed uptrends that have pulled back into a buy zone. "
+        "Entry rule: EMA9 > EMA21 > EMA50 · Supertrend bullish · Price near EMA9 or EMA21 · RSI 35–62 · Pullback 3–25%."
+    )
+
+    st.html("""<div style="display:flex; gap:16px; margin-bottom:10px; font-size:0.78rem; flex-wrap:wrap;">
+      <span style="background:#e8f5ec; border-radius:4px; padding:2px 10px;">🟢 Near EMA9 — tightest entry, trend still hot</span>
+      <span style="background:#fff8e1; border-radius:4px; padding:2px 10px;">🟡 Near EMA21 — standard pullback entry</span>
+      <span style="background:#f0f4fc; border-radius:4px; padding:2px 10px;">🔵 Deep — larger pullback, more confirmation needed</span>
+      <span style="background:#f8f9fa; border-radius:4px; padding:2px 10px;">PB Score 70+ = high quality setup</span>
+    </div>""")
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    pb_f1, pb_f2, pb_f3, pb_f4 = st.columns(4)
+    with pb_f1:
+        pb_stage_filter = st.multiselect(
+            "Stage",
+            ["🟢 Near EMA9", "🟡 Near EMA21", "🔵 Deep"],
+            default=["🟢 Near EMA9", "🟡 Near EMA21", "🔵 Deep"],
+            key="pb_stage",
+        )
+    with pb_f2:
+        pb_min_score = st.slider("Min PB Score", 0, 100, 40, 5, key="pb_min_score")
+    with pb_f3:
+        pb_cap_filter = st.multiselect(
+            "Cap",
+            ["LARGECAP", "MIDCAP", "SMALLCAP"],
+            default=[],
+            key="pb_cap",
+            placeholder="All caps",
+        )
+    with pb_f4:
+        pb_microcap = st.checkbox("Include Microcap", value=False, key="pb_micro",
+                                  help="Adds ~2,500 more stocks — much slower scan")
+
+    pb_f5, pb_f6, pb_f7 = st.columns(3)
+    with pb_f5:
+        pb_min_pullback = st.slider("Min Pullback %", 0, 20, 3, 1, key="pb_min_pb")
+    with pb_f6:
+        pb_max_pullback = st.slider("Max Pullback %", 5, 25, 20, 1, key="pb_max_pb")
+    with pb_f7:
+        pb_min_adx = st.slider("Min ADX", 0, 35, 18, 1, key="pb_min_adx")
+
+    pc1, pc2 = st.columns([1, 4])
+    with pc1:
+        pb_do_scan = st.button("🔍 Scan Now", type="primary", key="pb_scan_btn")
+    with pc2:
+        st.caption("Scans ~400 NSE Midcap + Smallcap stocks · ~30–60 sec. Enable Microcap for full universe (~5 min).")
+
+    if pb_do_scan:
+        scan_pullback_stocks.clear()
+        st.session_state["pb_scan_done"] = True
+
+    if not st.session_state.get("pb_scan_done"):
+        st.info("👆 Click **Scan Now** to find pullback setups.")
+    else:
+        with st.spinner("Scanning for pullback setups…"):
+            df_pb = scan_pullback_stocks(include_microcap=pb_microcap)
+
+        if df_pb.empty:
+            st.warning("No pullback setups found. Try relaxing filters or click Scan Now to refresh.")
+        else:
+            # Apply filters
+            filt_pb = df_pb[
+                (df_pb["Stage"].isin(pb_stage_filter)) &
+                (df_pb["PB Score"] >= pb_min_score) &
+                (df_pb["Pullback %"] >= pb_min_pullback) &
+                (df_pb["Pullback %"] <= pb_max_pullback) &
+                (df_pb["ADX"] >= pb_min_adx)
+            ].copy()
+            if pb_cap_filter:
+                filt_pb = filt_pb[filt_pb["Cap"].isin(pb_cap_filter)]
+
+            # Drop internal column
+            filt_pb = filt_pb.drop(columns=["_yf_ticker"], errors="ignore")
+
+            # ── Summary metrics ───────────────────────────────────────────────
+            n_ema9  = len(df_pb[df_pb["Stage"] == "🟢 Near EMA9"])
+            n_ema21 = len(df_pb[df_pb["Stage"] == "🟡 Near EMA21"])
+            n_deep  = len(df_pb[df_pb["Stage"] == "🔵 Deep"])
+            n_hq    = len(df_pb[df_pb["PB Score"] >= 70])
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Total Setups", len(df_pb))
+            m2.metric("Near EMA9",   n_ema9,  help="Tightest entry zone")
+            m3.metric("Near EMA21",  n_ema21, help="Standard pullback entry")
+            m4.metric("Deep",        n_deep,  help="Larger pullback, needs care")
+            m5.metric("High Quality (≥70)", n_hq)
+
+            st.markdown(f"**{len(filt_pb)} setups match filters** · {len(df_pb)} total pullbacks found")
+
+            if filt_pb.empty:
+                st.info("No setups match current filters. Try lowering Min PB Score or widening the Pullback % range.")
+            else:
+                def _pb_style(df):
+                    def row_style(row):
+                        s = str(row.get("Stage", ""))
+                        if "EMA9"  in s: return ["background-color:#e8f5ec"] * len(row)
+                        if "EMA21" in s: return ["background-color:#fff8e1"] * len(row)
+                        return ["background-color:#f0f4fc"] * len(row)
+
+                    def score_style(val):
+                        if not isinstance(val, (int, float)): return ""
+                        if val >= 70: return "color:#1a7a3c; font-weight:700"
+                        if val >= 50: return "color:#b8860b; font-weight:600"
+                        return "color:#888"
+
+                    def pb_pct_style(val):
+                        if not isinstance(val, (int, float)): return ""
+                        if 5.0 <= val <= 12.0: return "color:#1a7a3c; font-weight:700"   # sweet spot
+                        if val <= 5.0:          return "color:#b8860b"                   # shallow
+                        if val > 18.0:          return "color:#c0392b"                   # deep/risky
+                        return "color:#555"
+
+                    def chg_style(val):
+                        if not isinstance(val, float): return ""
+                        return "color:#1a7a3c; font-weight:600" if val > 0 else "color:#c0392b; font-weight:600"
+
+                    def adx_style(val):
+                        if not isinstance(val, float): return ""
+                        return "color:#1a5aad; font-weight:600" if val >= 25 else ""
+
+                    def rsi_style(val):
+                        if not isinstance(val, (int, float)): return ""
+                        if 40 <= val <= 55: return "color:#1a7a3c; font-weight:600"
+                        if val < 38:        return "color:#c0392b"
+                        return ""
+
+                    cols = df.columns.tolist()
+                    style = (df.style
+                               .apply(row_style, axis=1)
+                               .applymap(score_style, subset=["PB Score"])
+                               .applymap(pb_pct_style, subset=["Pullback %"])
+                               .applymap(chg_style,    subset=["Day Chg %"])
+                               .applymap(adx_style,    subset=["ADX"]))
+                    if "RSI" in cols: style = style.applymap(rsi_style, subset=["RSI"])
+                    return style.format({
+                        "Price (₹)":  "₹{:,.2f}",
+                        "EMA9":       "₹{:,.2f}",
+                        "EMA21":      "₹{:,.2f}",
+                        "EMA50":      "₹{:,.2f}",
+                        "Stop (₹)":   lambda v: f"₹{v:,.2f}" if v else "—",
+                        "Target (₹)": lambda v: f"₹{v:,.2f}" if v else "—",
+                        "Day Chg %":  "{:+.2f}%",
+                        "Pullback %": "{:.1f}%",
+                        "Vol Ratio":  "{:.1f}×",
+                        "ADX":        "{:.1f}",
+                        "RSI":        "{:.1f}",
+                    })
+
+                _pb_col_order = [
+                    "Symbol", "Name", "Cap", "Stage", "PB Score",
+                    "Price (₹)", "Day Chg %", "Pullback %",
+                    "EMA9", "EMA21", "EMA50",
+                    "RSI", "ADX", "Vol Ratio",
+                    "Stop (₹)", "Target (₹)", "ATR",
+                ]
+                _pb_dc = [c for c in _pb_col_order if c in filt_pb.columns]
+                df_pb_disp = filt_pb[_pb_dc].reset_index(drop=True)
+
+                st.dataframe(
+                    _pb_style(df_pb_disp),
+                    hide_index=True,
+                    width="stretch",
+                    height=min(700, 65 + len(df_pb_disp) * 38),
+                )
+
+                # ── What to look for explanation ─────────────────────────────
+                with st.expander("📖 How to read this table", expanded=False):
+                    st.markdown("""
+**Pullback %** — how far price has dropped from the 20-day high. Sweet spot is **5–12%** (green).
+Too shallow (<3%) may just be noise. Too deep (>20%) risks a trend break.
+
+**Stage tells you the entry precision:**
+- 🟢 **Near EMA9** — price is just above EMA9 within 1 ATR. Most aggressive entry, trend is very fresh.
+- 🟡 **Near EMA21** — price has pulled to the 21-day EMA. Standard textbook pullback entry.
+- 🔵 **Deep** — price touched EMA21 in the last 5 bars but has since moved up slightly. Slightly later entry.
+
+**Entry rule:** Buy when today's candle holds above EMA21. Stop goes 1 ATR below EMA21. Target is 3×ATR from entry.
+
+**PB Score** weights: full EMA stack (9>21>50>200), ADX strength, RSI in 40–55 zone, entry tightness, pullback depth.
+                    """)
+
+                st.download_button(
+                    "⬇ Download CSV",
+                    data=filt_pb[_pb_dc].to_csv(index=False).encode("utf-8"),
+                    file_name=f"pullback_setups_{date.today()}.csv",
+                    mime="text/csv",
+                    key="pb_dl",
+                )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 4 — MY PORTFOLIO
+# ════════════════════════════════════════════════════════════════════════════
+

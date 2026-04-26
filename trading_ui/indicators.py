@@ -230,7 +230,12 @@ def compute_all(
     d = df.copy()
     # Flatten MultiIndex columns that newer yfinance versions sometimes return
     if isinstance(d.columns, pd.MultiIndex):
-        d = d.droplevel(level=1, axis=1)
+        _OHLCV = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+        lvl = 0
+        if len(set(d.columns.get_level_values(0)) & _OHLCV) < \
+           len(set(d.columns.get_level_values(1)) & _OHLCV):
+            lvl = 1
+        d.columns = d.columns.get_level_values(lvl)
         d = d.loc[:, ~d.columns.duplicated()]
     # Ensure every OHLCV column is a 1-D Series, not a single-column DataFrame
     for _col in list(d.columns):

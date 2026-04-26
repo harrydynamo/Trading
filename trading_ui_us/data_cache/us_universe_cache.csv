@@ -1,0 +1,76 @@
+symbol,name,sector,index
+NVDA,NVIDIA Corporation,Technology,NASDAQ100
+TSLA,Tesla Inc,Consumer Disc,NASDAQ100
+META,Meta Platforms Inc,Technology,NASDAQ100
+AMZN,Amazon.com Inc,Consumer Disc,NASDAQ100
+GOOGL,Alphabet Inc,Technology,NASDAQ100
+MSFT,Microsoft Corporation,Technology,DOW30
+AAPL,Apple Inc,Technology,DOW30
+BRK-B,Berkshire Hathaway,Financials,SP500
+JPM,JPMorgan Chase,Financials,DOW30
+V,Visa Inc,Financials,DOW30
+MA,Mastercard Inc,Financials,SP500
+UNH,UnitedHealth Group,Healthcare,DOW30
+JNJ,Johnson & Johnson,Healthcare,DOW30
+XOM,Exxon Mobil,Energy,DOW30
+CVX,Chevron Corporation,Energy,DOW30
+PG,Procter & Gamble,Consumer Staples,DOW30
+KO,Coca-Cola Company,Consumer Staples,DOW30
+PEP,PepsiCo Inc,Consumer Staples,SP500
+WMT,Walmart Inc,Consumer Staples,DOW30
+HD,Home Depot,Consumer Disc,DOW30
+BAC,Bank of America,Financials,SP500
+GS,Goldman Sachs,Financials,DOW30
+AMD,Advanced Micro Devices,Technology,NASDAQ100
+INTC,Intel Corporation,Technology,NASDAQ100
+NFLX,Netflix Inc,Communication,NASDAQ100
+PYPL,PayPal Holdings,Financials,NASDAQ100
+ADBE,Adobe Inc,Technology,NASDAQ100
+CRM,Salesforce Inc,Technology,SP500
+ORCL,Oracle Corporation,Technology,SP500
+IBM,IBM Corporation,Technology,DOW30
+CSCO,Cisco Systems,Technology,DOW30
+DIS,Walt Disney Company,Communication,DOW30
+NKE,Nike Inc,Consumer Disc,DOW30
+MCD,McDonald's Corporation,Consumer Disc,DOW30
+SBUX,Starbucks Corporation,Consumer Disc,NASDAQ100
+COST,Costco Wholesale,Consumer Staples,NASDAQ100
+ABBV,AbbVie Inc,Healthcare,SP500
+PFE,Pfizer Inc,Healthcare,SP500
+MRK,Merck & Co,Healthcare,DOW30
+LLY,Eli Lilly,Healthcare,SP500
+TMO,Thermo Fisher Scientific,Healthcare,SP500
+AMGN,Amgen Inc,Healthcare,NASDAQ100
+GILD,Gilead Sciences,Healthcare,NASDAQ100
+BA,Boeing Company,Industrials,DOW30
+CAT,Caterpillar Inc,Industrials,DOW30
+MMM,3M Company,Industrials,DOW30
+HON,Honeywell International,Industrials,DOW30
+GE,GE Aerospace,Industrials,SP500
+RTX,RTX Corporation,Industrials,SP500
+LMT,Lockheed Martin,Industrials,SP500
+NEE,NextEra Energy,Utilities,SP500
+DUK,Duke Energy,Utilities,SP500
+AMT,American Tower,Real Estate,SP500
+SPG,Simon Property Group,Real Estate,SP500
+T,AT&T Inc,Communication,SP500
+VZ,Verizon Communications,Communication,DOW30
+CMCSA,Comcast Corporation,Communication,NASDAQ100
+SQ,Block Inc,Financials,SP500
+UBER,Uber Technologies,Technology,SP500
+LYFT,Lyft Inc,Technology,SP500
+SNAP,Snap Inc,Communication,SP500
+TWTR,X / Twitter,Communication,SP500
+COIN,Coinbase Global,Financials,SP500
+HOOD,Robinhood Markets,Financials,SP500
+PLTR,Palantir Technologies,Technology,SP500
+ARM,ARM Holdings,Technology,NASDAQ100
+SMCI,Super Micro Computer,Technology,NASDAQ100
+MU,Micron Technology,Technology,NASDAQ100
+QCOM,Qualcomm Inc,Technology,NASDAQ100
+AVGO,Broadcom Inc,Technology,NASDAQ100
+TXN,Texas Instruments,Technology,NASDAQ100
+AMAT,Applied Materials,Technology,NASDAQ100
+LRCX,Lam Research,Technology,NASDAQ100
+KLAC,KLA Corporation,Technology,NASDAQ100
+MRVL,Marvell Technology,Technology,NASDAQ100
