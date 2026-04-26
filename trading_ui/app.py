@@ -1022,12 +1022,13 @@ def scan_sme_stocks() -> pd.DataFrame:
         try:
             df = df.copy()
             df.dropna(subset=["Close"], inplace=True)
-            if len(df) < 20:
+            if len(df) < 2:     # need at least 2 rows for any calculation
                 continue
 
             close  = df["Close"]
             high   = df["High"]
             low    = df["Low"]
+            n      = len(df)
 
             ema9   = close.ewm(span=9,   adjust=False).mean()
             ema21  = close.ewm(span=21,  adjust=False).mean()
@@ -1035,68 +1036,69 @@ def scan_sme_stocks() -> pd.DataFrame:
 
             prev_c = close.shift(1)
             tr     = pd.concat([high-low, (high-prev_c).abs(), (low-prev_c).abs()], axis=1).max(axis=1)
-            atr_s  = tr.ewm(com=13, min_periods=14).mean()
+            atr_s  = tr.ewm(com=13, min_periods=3).mean()
 
             delta  = close.diff()
-            avg_g  = delta.clip(lower=0).ewm(com=13, min_periods=14).mean()
-            avg_l  = (-delta).clip(lower=0).ewm(com=13, min_periods=14).mean()
+            avg_g  = delta.clip(lower=0).ewm(com=13, min_periods=3).mean()
+            avg_l  = (-delta).clip(lower=0).ewm(com=13, min_periods=3).mean()
             rsi_s  = 100 - (100 / (1 + avg_g / avg_l.replace(0, np.nan)))
 
             up_move  = high - high.shift(1)
             dn_move  = low.shift(1) - low
             plus_dm  = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
             minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
-            atr14    = tr.ewm(com=13, min_periods=14).mean()
-            plus_di  = 100 * pd.Series(plus_dm,  index=df.index).ewm(com=13, min_periods=14).mean() / atr14.replace(0, np.nan)
-            minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(com=13, min_periods=14).mean() / atr14.replace(0, np.nan)
+            atr14    = tr.ewm(com=13, min_periods=3).mean()
+            plus_di  = 100 * pd.Series(plus_dm,  index=df.index).ewm(com=13, min_periods=3).mean() / atr14.replace(0, np.nan)
+            minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(com=13, min_periods=3).mean() / atr14.replace(0, np.nan)
             dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-            adx_s    = dx.ewm(com=13, min_periods=14).mean()
+            adx_s    = dx.ewm(com=13, min_periods=3).mean()
 
-            # Supertrend
-            hl2     = (high + low) / 2
-            b_upper = (hl2 + 3.0 * atr_s).values
-            b_lower = (hl2 - 3.0 * atr_s).values
-            c_arr   = close.values
-            n       = len(df)
-            f_upper = b_upper.copy(); f_lower = b_lower.copy()
-            for _i in range(1, n):
-                if np.isnan(atr_s.iloc[_i]): continue
-                f_upper[_i] = b_upper[_i] if (np.isnan(f_upper[_i-1]) or b_upper[_i] < f_upper[_i-1] or c_arr[_i-1] > f_upper[_i-1]) else f_upper[_i-1]
-                f_lower[_i] = b_lower[_i] if (np.isnan(f_lower[_i-1]) or b_lower[_i] > f_lower[_i-1] or c_arr[_i-1] < f_lower[_i-1]) else f_lower[_i-1]
-            st_dir = np.zeros(n, dtype=int)
-            for _i in range(1, n):
-                if np.isnan(f_upper[_i]) or np.isnan(f_lower[_i]): continue
-                pd_ = st_dir[_i-1]
-                if pd_ == 0:   st_dir[_i] = 1 if c_arr[_i] >= (f_upper[_i]+f_lower[_i])/2 else -1
-                elif pd_ == 1: st_dir[_i] = -1 if c_arr[_i] < f_lower[_i] else 1
-                else:          st_dir[_i] =  1 if c_arr[_i] > f_upper[_i] else -1
+            # Supertrend (only if enough rows)
+            if n >= 5:
+                hl2     = (high + low) / 2
+                b_upper = (hl2 + 3.0 * atr_s).values
+                b_lower = (hl2 - 3.0 * atr_s).values
+                c_arr   = close.values
+                f_upper = b_upper.copy(); f_lower = b_lower.copy()
+                for _i in range(1, n):
+                    if np.isnan(atr_s.iloc[_i]): continue
+                    f_upper[_i] = b_upper[_i] if (np.isnan(f_upper[_i-1]) or b_upper[_i] < f_upper[_i-1] or c_arr[_i-1] > f_upper[_i-1]) else f_upper[_i-1]
+                    f_lower[_i] = b_lower[_i] if (np.isnan(f_lower[_i-1]) or b_lower[_i] > f_lower[_i-1] or c_arr[_i-1] < f_lower[_i-1]) else f_lower[_i-1]
+                st_dir = np.zeros(n, dtype=int)
+                for _i in range(1, n):
+                    if np.isnan(f_upper[_i]) or np.isnan(f_lower[_i]): continue
+                    pd_ = st_dir[_i-1]
+                    if pd_ == 0:   st_dir[_i] = 1 if c_arr[_i] >= (f_upper[_i]+f_lower[_i])/2 else -1
+                    elif pd_ == 1: st_dir[_i] = -1 if c_arr[_i] < f_lower[_i] else 1
+                    else:          st_dir[_i] =  1 if c_arr[_i] > f_upper[_i] else -1
+                st = int(st_dir[-1])
+            else:
+                st = 0   # unknown
 
             lc      = float(close.iloc[-1])
             pc      = float(close.iloc[-2]) if n >= 2 else lc
             e9      = float(ema9.iloc[-1])
             e21     = float(ema21.iloc[-1])
             e50     = float(ema50.iloc[-1])
-            rsi     = float(rsi_s.iloc[-1])
-            adx     = float(adx_s.iloc[-1])
-            pdi     = float(plus_di.iloc[-1])
-            mdi     = float(minus_di.iloc[-1])
-            st      = int(st_dir[-1])
-            atr_val = float(atr_s.iloc[-1])
-            avg_vol = float(df["Volume"].iloc[-20:].mean())
+            rsi     = float(rsi_s.iloc[-1]) if not np.isnan(rsi_s.iloc[-1]) else 50.0
+            adx     = float(adx_s.iloc[-1]) if not np.isnan(adx_s.iloc[-1]) else 0.0
+            pdi     = float(plus_di.iloc[-1]) if not np.isnan(plus_di.iloc[-1]) else 0.0
+            mdi     = float(minus_di.iloc[-1]) if not np.isnan(minus_di.iloc[-1]) else 0.0
+            atr_val = float(atr_s.iloc[-1]) if not np.isnan(atr_s.iloc[-1]) else 0.0
+            avg_vol = float(df["Volume"].iloc[-min(20, n):].mean())
             vol_ratio = round(float(df["Volume"].iloc[-1]) / avg_vol, 1) if avg_vol > 0 else 0
             chg     = (lc - pc) / pc * 100 if pc else 0
 
-            if any(np.isnan(v) for v in (rsi, adx, e9, e21)):
-                continue
+            # Liquidity (no hard filter — show all stocks, flag illiquid ones)
+            if avg_vol >= 100_000:   liquidity = "🟢 High"
+            elif avg_vol >= 20_000:  liquidity = "🟡 Medium"
+            elif avg_vol >= 5_000:   liquidity = "🔴 Low"
+            else:                    liquidity = "⚫ Very Low"
 
-            # SME-specific liquidity guard — skip if avg daily volume < 5,000 shares
-            if avg_vol < 5000:
-                continue
-
-            # Signal
-            if e9 > e21 > e50 and lc > e21 and st == 1 and pdi > mdi:
+            # Signal (requires reasonable data; fall back to WATCH for sparse stocks)
+            if n >= 10 and e9 > e21 > e50 and lc > e21 and st == 1 and pdi > mdi:
                 direction = "BUY"
-            elif e9 < e21 < e50 and lc < e21 and st == -1 and mdi > pdi:
+            elif n >= 10 and e9 < e21 < e50 and lc < e21 and st == -1 and mdi > pdi:
                 direction = "SELL"
             else:
                 direction = "WATCH"
@@ -1123,11 +1125,6 @@ def scan_sme_stocks() -> pd.DataFrame:
             sl     = round(lc - 1.5 * atr_val, 2) if direction == "BUY"  else (round(lc + 1.5 * atr_val, 2) if direction == "SELL" else None)
             target = round(lc + 3.0 * atr_val, 2) if direction == "BUY"  else (round(lc - 3.0 * atr_val, 2) if direction == "SELL" else None)
 
-            # Liquidity rating
-            if avg_vol >= 100_000:   liquidity = "🟢 High"
-            elif avg_vol >= 20_000:  liquidity = "🟡 Medium"
-            else:                    liquidity = "🔴 Low"
-
             # Metadata from universe (optional enrichment)
             s_meta = sym_to_meta.get(sym, {})
             name   = s_meta.get("name", sym)
@@ -1139,6 +1136,7 @@ def scan_sme_stocks() -> pd.DataFrame:
                 "Score":      score,
                 "Price (₹)":  round(lc, 2),
                 "Day Chg %":  round(chg, 2),
+                "Days":       n,
                 "ADX":        round(adx, 1),
                 "RSI":        round(rsi, 1),
                 "Vol Ratio":  vol_ratio,
