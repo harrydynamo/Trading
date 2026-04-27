@@ -101,22 +101,66 @@ st.markdown("""
 /* ── Hide Streamlit chrome, white page background ── */
 #MainMenu  { visibility: hidden; }
 footer     { visibility: hidden; }
-/* Make header transparent and remove its space, but keep the sidebar toggle button */
 header     { background: transparent !important; }
 [data-testid="stToolbar"]    { visibility: hidden; }
 [data-testid="stDecoration"] { display: none; }
-/* Always show the sidebar open/close arrow button */
+/* Always show the sidebar hamburger/collapse button */
 header button,
 [data-testid="stSidebarCollapsedControl"],
 [data-testid="stSidebarCollapsedControl"] button {
     visibility: visible !important;
     display:    flex   !important;
 }
-.stApp    { background-color: #ffffff; }
+.stApp    { background-color: #f7f8fa; }
 .block-container {
-    padding-top: 0.5rem !important;
+    padding-top: 1rem !important;
     padding-bottom: 1rem !important;
     max-width: 100% !important;
+}
+
+/* ── Sidebar nav styling ── */
+[data-testid="stSidebar"] {
+    background-color: #1a2236 !important;
+}
+[data-testid="stSidebar"] * { color: #d0d8e8 !important; }
+[data-testid="stSidebar"] hr { border-color: #2e3a52 !important; }
+
+/* Nav buttons */
+div[data-testid="stSidebar"] div.stButton > button {
+    width: 100%;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    color: #a0aec0 !important;
+    font-size: 0.92rem;
+    font-weight: 500;
+    text-align: left;
+    padding: 9px 14px;
+    margin-bottom: 2px;
+    transition: background 0.15s;
+}
+div[data-testid="stSidebar"] div.stButton > button:hover {
+    background: #2e3a52 !important;
+    color: #ffffff !important;
+}
+div[data-testid="stSidebar"] div.stButton > button[kind="primary"] {
+    background: #2563eb !important;
+    color: #ffffff !important;
+    font-weight: 700;
+}
+
+/* Sidebar section labels */
+.sidebar-section {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #4a5568;
+    padding: 14px 4px 4px 4px;
+}
+/* Sidebar collapse button (hamburger) */
+[data-testid="stSidebarCollapsedControl"] {
+    top: 12px !important;
 }
 
 /* ── Stock header card ── */
@@ -1965,179 +2009,218 @@ def _strength_dots(n: int) -> str:
     return "●" * n + "○" * (3 - n)
 
 
+# ─── Page state ───────────────────────────────────────────────────────────────
+
+if "page" not in st.session_state:
+    st.session_state["page"] = "chart"
+
+
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("### 📈 Live Trading")
-
-    category = st.radio(
-        "Category",
-        ["Stocks", "Indices", "Currencies", "Custom"],
-        horizontal=True,
-        label_visibility="collapsed",
+    # ── App title ─────────────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='font-size:1.2rem;font-weight:700;color:#fff;padding:4px 0 12px 0;'>"
+        "📈 Trading Suite</div>",
+        unsafe_allow_html=True,
     )
 
-    stock = None
+    # ── Navigation ────────────────────────────────────────────────────────────
+    st.markdown("<div class='sidebar-section'>Navigation</div>", unsafe_allow_html=True)
 
-    if category == "Stocks":
-        universe = load_universe()
-        lbl   = st.selectbox("Stock", list(universe.keys()),
-                             placeholder="🔍 Search symbol or name…",
-                             label_visibility="collapsed")
-        stock = universe[lbl]
+    _NAV = [
+        ("chart",     "📊  Live Chart"),
+        ("scan",      "🎯  Trade Opportunities"),
+        ("pullback",  "🔁  Pullback Scanner"),
+        ("sme",       "🏭  SME Stocks"),
+        ("sentiment", "🌡️  Market Sentiment"),
+        ("portfolio", "📋  My Portfolio"),
+    ]
+    for _page_id, _page_label in _NAV:
+        _kind = "primary" if st.session_state["page"] == _page_id else "secondary"
+        if st.button(_page_label, key=f"nav_{_page_id}", type=_kind, use_container_width=True):
+            st.session_state["page"] = _page_id
+            st.rerun()
 
-    elif category == "Indices":
-        idx_type = st.radio(
-            "Type", ["Index", "Futures", "Options"],
-            horizontal=True, key="idx_type",
+    st.divider()
+
+    # ── Chart controls — only shown on the Live Chart page ───────────────────
+    if st.session_state["page"] == "chart":
+
+        stock = None
+
+        st.markdown("<div class='sidebar-section'>Instrument</div>", unsafe_allow_html=True)
+
+        category = st.radio(
+            "Category",
+            ["Stocks", "Indices", "Currencies", "Custom"],
+            horizontal=True,
             label_visibility="collapsed",
         )
 
-        if idx_type == "Index":
-            key   = st.selectbox("Index", list(INDICES.keys()), label_visibility="collapsed")
-            stock = INDICES[key]
+        if category == "Stocks":
+            universe = load_universe()
+            lbl   = st.selectbox("Stock", list(universe.keys()),
+                                 placeholder="🔍 Search symbol or name…",
+                                 label_visibility="collapsed")
+            stock = universe[lbl]
 
-        elif idx_type == "Futures":
-            underlying = st.selectbox(
-                "Underlying", list(_FNO_UNDERLYINGS.keys()),
-                label_visibility="collapsed", key="fut_ul",
-            )
-            expiries   = _nse_monthly_expiries(3)
-            exp_choice = st.selectbox(
-                "Expiry", range(len(expiries)),
-                format_func=lambda i: expiries[i][0],
-                label_visibility="collapsed", key="fut_exp",
-            )
-            label, code = expiries[exp_choice]
-            ticker = f"{underlying}{code}FUT.NS"
-            stock  = {
-                "symbol":     f"{underlying} FUT",
-                "name":       f"{underlying} Futures — {label}",
-                "yf_ticker":  ticker,
-                "exchange":   "NSE",
-                "cap":        "futures",
-                "underlying": underlying,
-                "exp_label":  label,
-            }
-            st.caption(f"Chart uses {underlying} spot (NSE F&O not on Yahoo Finance)")
-
-        else:  # Options
-            underlying = st.selectbox(
-                "Underlying", list(_FNO_UNDERLYINGS.keys()),
-                label_visibility="collapsed", key="opt_ul",
-            )
-            ul_meta = _FNO_UNDERLYINGS[underlying]
-
-            expiries   = _nse_monthly_expiries(3)
-            exp_choice = st.selectbox(
-                "Expiry", range(len(expiries)),
-                format_func=lambda i: expiries[i][0],
-                label_visibility="collapsed", key="opt_exp_sel",
-            )
-            label, code = expiries[exp_choice]
-
-            # Fetch spot to centre strikes on ATM
-            spot = fetch_spot_price(ul_meta["spot_ticker"]) or 23000.0
-            step = ul_meta["step"]
-            strikes = _atm_strikes(spot, step, 12)
-            atm     = round(spot / step) * step
-            atm_idx = strikes.index(atm) if atm in strikes else len(strikes) // 2
-
-            strike = st.selectbox(
-                "Strike", strikes,
-                index=atm_idx,
-                format_func=lambda s: f"{s}  {'← ATM' if s == atm else ('↑ OTM' if s > spot else '↓ ITM')}",
-                label_visibility="collapsed", key="opt_strike",
-            )
-            opt_type = st.radio(
-                "CE / PE", ["CE", "PE"],
-                horizontal=True, key="opt_type",
+        elif category == "Indices":
+            idx_type = st.radio(
+                "Type", ["Index", "Futures", "Options"],
+                horizontal=True, key="idx_type",
                 label_visibility="collapsed",
             )
 
-            ticker = f"{underlying}{code}{strike}{opt_type}.NS"
-            stock  = {
-                "symbol":     f"{underlying} {strike}{opt_type}",
-                "name":       f"{underlying} {strike} {opt_type} — {label}",
-                "yf_ticker":  ticker,
-                "exchange":   "NSE",
-                "cap":        "options",
-                "underlying": underlying,
-                "strike":     strike,
-                "opt_type":   opt_type,
-                "exp_label":  label,
-                "exp_code":   code,
-                "spot":       spot,
-                "atm":        atm,
-            }
-            st.caption(f"Spot ≈ {spot:,.0f}  ·  ATM {atm}")
+            if idx_type == "Index":
+                key   = st.selectbox("Index", list(INDICES.keys()), label_visibility="collapsed")
+                stock = INDICES[key]
 
-    elif category == "Currencies":
-        key   = st.selectbox("Pair", list(CURRENCIES.keys()), label_visibility="collapsed")
-        stock = CURRENCIES[key]
+            elif idx_type == "Futures":
+                underlying = st.selectbox(
+                    "Underlying", list(_FNO_UNDERLYINGS.keys()),
+                    label_visibility="collapsed", key="fut_ul",
+                )
+                expiries   = _nse_monthly_expiries(3)
+                exp_choice = st.selectbox(
+                    "Expiry", range(len(expiries)),
+                    format_func=lambda i: expiries[i][0],
+                    label_visibility="collapsed", key="fut_exp",
+                )
+                label, code = expiries[exp_choice]
+                ticker = f"{underlying}{code}FUT.NS"
+                stock  = {
+                    "symbol":     f"{underlying} FUT",
+                    "name":       f"{underlying} Futures — {label}",
+                    "yf_ticker":  ticker,
+                    "exchange":   "NSE",
+                    "cap":        "futures",
+                    "underlying": underlying,
+                    "exp_label":  label,
+                }
+                st.caption(f"Chart uses {underlying} spot (NSE F&O not on Yahoo Finance)")
 
-    else:  # Custom
-        raw = st.text_input(
-            "Symbol",
-            placeholder="e.g. RELIANCE25MARFUT.NS  or  NIFTY25APR23000CE.NS",
-            label_visibility="collapsed",
-        )
-        st.caption("Enter any yfinance ticker — NSE futures, options, global stocks, crypto.")
-        if raw.strip():
-            sym   = raw.strip().split(".")[0].upper()
-            exch  = "NSE" if raw.upper().endswith(".NS") else "BSE" if raw.upper().endswith(".BO") else "—"
-            stock = {"symbol": sym, "name": raw.strip(), "exchange": exch,
-                     "cap": "custom", "yf_ticker": raw.strip()}
+            else:  # Options
+                underlying = st.selectbox(
+                    "Underlying", list(_FNO_UNDERLYINGS.keys()),
+                    label_visibility="collapsed", key="opt_ul",
+                )
+                ul_meta = _FNO_UNDERLYINGS[underlying]
 
-    st.html("<hr class='thin-divider'>")
+                expiries   = _nse_monthly_expiries(3)
+                exp_choice = st.selectbox(
+                    "Expiry", range(len(expiries)),
+                    format_func=lambda i: expiries[i][0],
+                    label_visibility="collapsed", key="opt_exp_sel",
+                )
+                label, code = expiries[exp_choice]
 
-    st.markdown("**Timeframe**")
-    timeframe   = st.select_slider("Timeframe", options=list(TIMEFRAMES.keys()), value="1D",
-                                    label_visibility="collapsed")
-    tf          = TIMEFRAMES[timeframe]
-    period_bars = st.slider("Bars", 50, tf["max_bars"], min(200, tf["max_bars"]),
-                             step=10, label_visibility="collapsed")
-    st.caption(f"{period_bars} bars  ·  {timeframe} chart")
+                spot    = fetch_spot_price(ul_meta["spot_ticker"]) or 23000.0
+                step    = ul_meta["step"]
+                strikes = _atm_strikes(spot, step, 12)
+                atm     = round(spot / step) * step
+                atm_idx = strikes.index(atm) if atm in strikes else len(strikes) // 2
 
-    st.html("<hr class='thin-divider'>")
+                strike = st.selectbox(
+                    "Strike", strikes,
+                    index=atm_idx,
+                    format_func=lambda s: f"{s}  {'← ATM' if s == atm else ('↑ OTM' if s > spot else '↓ ITM')}",
+                    label_visibility="collapsed", key="opt_strike",
+                )
+                opt_type = st.radio(
+                    "CE / PE", ["CE", "PE"],
+                    horizontal=True, key="opt_type",
+                    label_visibility="collapsed",
+                )
 
-    st.markdown("**Overlays**")
-    ind_ema        = st.checkbox("EMA  9 / 21 / 50 / 200", value=True)
-    ind_bb         = st.checkbox("Bollinger Bands",          value=True)
-    ind_vwap       = st.checkbox("VWAP  (intraday only)",    value=True)
-    ind_supertrend = st.checkbox("Supertrend  (10, 3)",      value=False)
-    ind_donchian   = st.checkbox("Donchian Channels  (20)",  value=False)
+                ticker = f"{underlying}{code}{strike}{opt_type}.NS"
+                stock  = {
+                    "symbol":     f"{underlying} {strike}{opt_type}",
+                    "name":       f"{underlying} {strike} {opt_type} — {label}",
+                    "yf_ticker":  ticker,
+                    "exchange":   "NSE",
+                    "cap":        "options",
+                    "underlying": underlying,
+                    "strike":     strike,
+                    "opt_type":   opt_type,
+                    "exp_label":  label,
+                    "exp_code":   code,
+                    "spot":       spot,
+                    "atm":        atm,
+                }
+                st.caption(f"Spot ≈ {spot:,.0f}  ·  ATM {atm}")
 
-    st.markdown("**Sub-charts**")
-    ind_rsi   = st.checkbox("RSI (14)",               value=True)
-    ind_macd  = st.checkbox("MACD",                   value=True)
-    ind_stoch = st.checkbox("Stochastic",             value=False)
+        elif category == "Currencies":
+            key   = st.selectbox("Pair", list(CURRENCIES.keys()), label_visibility="collapsed")
+            stock = CURRENCIES[key]
 
-    st.markdown("**Signal Detection**")
-    ind_candle = st.checkbox("Candlestick Patterns",  value=True)
-    ind_volume = st.checkbox("Volume Signals",         value=True)
+        else:  # Custom
+            raw = st.text_input(
+                "Symbol",
+                placeholder="e.g. RELIANCE25MARFUT.NS  or  NIFTY25APR23000CE.NS",
+                label_visibility="collapsed",
+            )
+            st.caption("Enter any yfinance ticker — NSE futures, options, global stocks, crypto.")
+            if raw.strip():
+                sym   = raw.strip().split(".")[0].upper()
+                exch  = "NSE" if raw.upper().endswith(".NS") else "BSE" if raw.upper().endswith(".BO") else "—"
+                stock = {"symbol": sym, "name": raw.strip(), "exchange": exch,
+                         "cap": "custom", "yf_ticker": raw.strip()}
 
-    st.html("<hr class='thin-divider'>")
+        st.divider()
+        st.markdown("<div class='sidebar-section'>Timeframe</div>", unsafe_allow_html=True)
+        timeframe   = st.select_slider("Timeframe", options=list(TIMEFRAMES.keys()), value="1D",
+                                       label_visibility="collapsed")
+        tf          = TIMEFRAMES[timeframe]
+        period_bars = st.slider("Bars", 50, tf["max_bars"], min(200, tf["max_bars"]),
+                                step=10, label_visibility="collapsed")
+        st.caption(f"{period_bars} bars  ·  {timeframe} chart")
 
-    st.markdown("**Support & Resistance**")
-    sr_pivot = st.checkbox("Pivot Points",       value=True)
-    sr_swing = st.checkbox("Swing Highs / Lows", value=True)
-    sr_fib   = st.checkbox("Fibonacci",          value=timeframe in ("1D", "1W"))
+        st.divider()
+        st.markdown("<div class='sidebar-section'>Overlays</div>", unsafe_allow_html=True)
+        ind_ema        = st.checkbox("EMA  9 / 21 / 50 / 200", value=True)
+        ind_bb         = st.checkbox("Bollinger Bands",          value=True)
+        ind_vwap       = st.checkbox("VWAP  (intraday only)",    value=True)
+        ind_supertrend = st.checkbox("Supertrend  (10, 3)",      value=False)
+        ind_donchian   = st.checkbox("Donchian Channels  (20)",  value=False)
 
-    st.html("<hr class='thin-divider'>")
-    if st.button("🔄  Refresh live data", type="primary", width="stretch"):
-        st.cache_data.clear()
-        st.rerun()
+        st.markdown("<div class='sidebar-section'>Sub-charts</div>", unsafe_allow_html=True)
+        ind_rsi   = st.checkbox("RSI (14)",              value=True)
+        ind_macd  = st.checkbox("MACD",                  value=True)
+        ind_stoch = st.checkbox("Stochastic",            value=False)
+
+        st.markdown("<div class='sidebar-section'>Signals</div>", unsafe_allow_html=True)
+        ind_candle = st.checkbox("Candlestick Patterns", value=True)
+        ind_volume = st.checkbox("Volume Signals",        value=True)
+
+        st.divider()
+        st.markdown("<div class='sidebar-section'>Support & Resistance</div>", unsafe_allow_html=True)
+        sr_pivot = st.checkbox("Pivot Points",       value=True)
+        sr_swing = st.checkbox("Swing Highs / Lows", value=True)
+        sr_fib   = st.checkbox("Fibonacci",          value=timeframe in ("1D", "1W"))
+
+        st.divider()
+        if st.button("🔄  Refresh", type="primary", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    else:
+        # Non-chart pages: set safe defaults so chart variables always exist
+        stock       = None
+        timeframe   = "1D"
+        tf          = TIMEFRAMES[timeframe]
+        period_bars = 200
+        ind_ema = ind_bb = ind_vwap = ind_rsi = ind_macd = ind_candle = ind_volume = True
+        ind_supertrend = ind_donchian = ind_stoch = False
+        sr_pivot = sr_swing = True
+        sr_fib   = False
 
 
-# ─── Top-level tab layout ─────────────────────────────────────────────────────
-tab_chart, tab_scan, tab_sentiment, tab_portfolio, tab_pullback, tab_sme = st.tabs([
-    "📊  Live Chart", "🎯  Trade Opportunities", "🌡️  Market Sentiment",
-    "📋  My Portfolio", "🔁  Pullback Scanner", "🏭  SME Stocks"
-])
+# ─── Page routing ─────────────────────────────────────────────────────────────
+_page = st.session_state["page"]
 
 
-with tab_portfolio:
+if _page == "portfolio":
     st.markdown("### 📋 My Portfolio")
     st.caption("Track your Zerodha trades — live P&L, current signal, and risk status for each position.")
 
@@ -2586,746 +2669,745 @@ with tab_portfolio:
                         f"Consider taking profit — trend is working against you."
                     )
 
-with tab_chart:
+if _page == "chart":
 
     if stock is None:
         st.info("👈  Select an instrument from the sidebar to get started.")
 
-if stock is not None:
-  with tab_chart:
-    itype = _detect_itype(stock["yf_ticker"])
+    elif stock is not None:
+        itype = _detect_itype(stock["yf_ticker"])
 
-    with st.spinner(f"Loading {stock['symbol']}…"):
-        df_raw  = fetch_ohlcv(stock["yf_ticker"], tf["interval"], tf["period"])
-        info    = fetch_info(stock["yf_ticker"])
+        with st.spinner(f"Loading {stock['symbol']}…"):
+            df_raw  = fetch_ohlcv(stock["yf_ticker"], tf["interval"], tf["period"])
+            info    = fetch_info(stock["yf_ticker"])
 
-    # ── F&O fallback: NSE F&O OHLCV is not on Yahoo Finance → use spot index ─
-    _fno_fallback_used = False
-    if df_raw is None and itype in ("futures", "options"):
-        ul = stock.get("underlying", "")
-        if ul in _FNO_UNDERLYINGS:
-            spot_ticker = _FNO_UNDERLYINGS[ul]["spot_ticker"]
-            df_raw = fetch_ohlcv(spot_ticker, tf["interval"], tf["period"])
-            if df_raw is not None:
-                _fno_fallback_used = True
+        # ── F&O fallback: NSE F&O OHLCV is not on Yahoo Finance → use spot index ─
+        _fno_fallback_used = False
+        if df_raw is None and itype in ("futures", "options"):
+            ul = stock.get("underlying", "")
+            if ul in _FNO_UNDERLYINGS:
+                spot_ticker = _FNO_UNDERLYINGS[ul]["spot_ticker"]
+                df_raw = fetch_ohlcv(spot_ticker, tf["interval"], tf["period"])
+                if df_raw is not None:
+                    _fno_fallback_used = True
 
-    if df_raw is None:
-        st.error(f"No data for **{stock['symbol']}** ({timeframe}). "
-                 "Try a different timeframe or check the symbol.")
-        st.stop()
+        if df_raw is None:
+            st.error(f"No data for **{stock['symbol']}** ({timeframe}). "
+                     "Try a different timeframe or check the symbol.")
+            st.stop()
 
-    df_raw = df_raw.dropna(subset=["Close", "High", "Low", "Open"]).copy()
+        df_raw = df_raw.dropna(subset=["Close", "High", "Low", "Open"]).copy()
 
-    # Compute indicators on the FULL fetched history so EMA(200), ADX, Supertrend etc.
-    # have enough bars to converge accurately.  Trim to period_bars for display AFTER.
-    df_enriched_full = _cached_compute_all(df_raw,
-                                           use_supertrend=ind_supertrend,
-                                           use_donchian=ind_donchian)
-    df_enriched = df_enriched_full.tail(period_bars).copy()
+        # Compute indicators on the FULL fetched history so EMA(200), ADX, Supertrend etc.
+        # have enough bars to converge accurately.  Trim to period_bars for display AFTER.
+        df_enriched_full = _cached_compute_all(df_raw,
+                                               use_supertrend=ind_supertrend,
+                                               use_donchian=ind_donchian)
+        df_enriched = df_enriched_full.tail(period_bars).copy()
 
-    signal_result = _cached_compute_signals(
-        df_enriched,
-        lookback=period_bars,
-        use_candlestick=ind_candle,
-        use_volume=ind_volume,
-    )
-    bias          = signal_result["current_bias"]
-    score         = signal_result["strength_score"]
-    signals       = signal_result["signals"]
-    regime        = signal_result.get("regime", "MIXED")
+        signal_result = _cached_compute_signals(
+            df_enriched,
+            lookback=period_bars,
+            use_candlestick=ind_candle,
+            use_volume=ind_volume,
+        )
+        bias          = signal_result["current_bias"]
+        score         = signal_result["strength_score"]
+        signals       = signal_result["signals"]
+        regime        = signal_result.get("regime", "MIXED")
 
-    sr_levels = _cached_sr_levels(df_enriched, sr_pivot, sr_swing, sr_fib)
+        sr_levels = _cached_sr_levels(df_enriched, sr_pivot, sr_swing, sr_fib)
 
-    # Always use fast_info for live price display — never rely on cached OHLCV for this
-    # For BSE stocks, try NSE ticker first (more liquid, more reliable live feed)
-    def _get_fast_info(yf_ticker: str):
-        candidates = [yf_ticker]
-        if yf_ticker.endswith(".BO"):
-            candidates.insert(0, yf_ticker.replace(".BO", ".NS"))
-        for t in candidates:
-            try:
-                fi = yf.Ticker(t).fast_info
-                if fi and fi.last_price:
-                    return fi
-            except Exception:
-                pass
-        return None
+        # Always use fast_info for live price display — never rely on cached OHLCV for this
+        # For BSE stocks, try NSE ticker first (more liquid, more reliable live feed)
+        def _get_fast_info(yf_ticker: str):
+            candidates = [yf_ticker]
+            if yf_ticker.endswith(".BO"):
+                candidates.insert(0, yf_ticker.replace(".BO", ".NS"))
+            for t in candidates:
+                try:
+                    fi = yf.Ticker(t).fast_info
+                    if fi and fi.last_price:
+                        return fi
+                except Exception:
+                    pass
+            return None
 
-    _fi_live = _get_fast_info(stock["yf_ticker"])
+        _fi_live = _get_fast_info(stock["yf_ticker"])
 
-    if _fi_live and _fi_live.last_price:
-        last_close = float(_fi_live.last_price)
-        prev_close = float(_fi_live.regular_market_previous_close) if _fi_live.regular_market_previous_close else last_close
-        day_high   = float(_fi_live.day_high) if _fi_live.day_high else last_close
-        day_low    = float(_fi_live.day_low)  if _fi_live.day_low  else last_close
-    else:
-        last_close = float(df_raw["Close"].iloc[-1])
-        prev_close = float(df_raw["Close"].iloc[-2]) if len(df_raw) > 1 else last_close
-        day_high   = float(df_raw["High"].max())
-        day_low    = float(df_raw["Low"].min())
+        if _fi_live and _fi_live.last_price:
+            last_close = float(_fi_live.last_price)
+            prev_close = float(_fi_live.regular_market_previous_close) if _fi_live.regular_market_previous_close else last_close
+            day_high   = float(_fi_live.day_high) if _fi_live.day_high else last_close
+            day_low    = float(_fi_live.day_low)  if _fi_live.day_low  else last_close
+        else:
+            last_close = float(df_raw["Close"].iloc[-1])
+            prev_close = float(df_raw["Close"].iloc[-2]) if len(df_raw) > 1 else last_close
+            day_high   = float(df_raw["High"].max())
+            day_low    = float(df_raw["Low"].min())
 
-    change_abs = last_close - prev_close
-    change_pct = change_abs / prev_close * 100 if prev_close else 0.0
-    volume     = int(df_raw["Volume"].iloc[-1])
+        change_abs = last_close - prev_close
+        change_pct = change_abs / prev_close * 100 if prev_close else 0.0
+        volume     = int(df_raw["Volume"].iloc[-1])
 
-    is_up = change_pct >= 0
-
-
-    # ════════════════════════════════════════════════════════════════════════════
-    # SECTION 1 — STOCK HEADER
-    # ════════════════════════════════════════════════════════════════════════════
-
-    chg_cls   = "header-up" if is_up else "header-down"
-    chg_arrow = "▲" if is_up else "▼"
-    pfx       = "" if itype in ("index", "currency") else "₹"
-
-    st.html(f"""
-    <div class="header-card">
-      <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
-        <div>
-          <p class="header-symbol">{stock['symbol']}&nbsp;&nbsp;{_itype_badge(itype)}</p>
-          <p class="header-name">{stock['name']}  ·  {stock['exchange']}  ·  {stock['cap'].upper()}</p>
-        </div>
-        <div style="text-align:right;">
-          <p class="header-price">{pfx}{last_close:,.2f}</p>
-          <p class="{chg_cls}">{chg_arrow} {abs(change_pct):.2f}%&nbsp;&nbsp;{change_abs:+.2f}</p>
-          <p style="font-size:0.7rem; color:#aaa; margin:0;">Last traded price · NSE official close may differ slightly</p>
-        </div>
-      </div>
-    </div>
-    """)
+        is_up = change_pct >= 0
 
 
-    # ── Key stats pills ───────────────────────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════════════
+        # SECTION 1 — STOCK HEADER
+        # ════════════════════════════════════════════════════════════════════════════
 
-    def _pill(label: str, value: str) -> str:
-        return (f'<div class="stat-pill">'
-                f'<div class="label">{label}</div>'
-                f'<div class="value">{value}</div>'
-                f'</div>')
-
-    hi52  = info.get("fiftyTwoWeekHigh")
-    lo52  = info.get("fiftyTwoWeekLow")
-    mc    = info.get("marketCap")
-    pe    = info.get("trailingPE")
-    beta  = info.get("beta")
-    avgv  = info.get("averageVolume")
-
-    pills = [
-        _pill("Day High",  _fmt_price(day_high)),
-        _pill("Day Low",   _fmt_price(day_low)),
-        _pill("Volume",    _fmt_vol(volume)),
-        _pill("52W High",  _fmt_price(hi52)),
-        _pill("52W Low",   _fmt_price(lo52)),
-        _pill("Mkt Cap",   f"₹{mc/1e7:.0f} Cr" if mc else "—"),
-        _pill("P/E",       f"{pe:.1f}" if pe and pe < 5000 else "—"),
-        _pill("Beta",      f"{beta:.2f}" if beta else "—"),
-        _pill("Avg Vol",   _fmt_vol(int(avgv)) if avgv else "—"),
-    ]
-
-    st.html(f'<div class="stats-row">{"".join(pills)}</div>')
-
-    # ── F&O info banner ───────────────────────────────────────────────────────────
-    if _fno_fallback_used:
-        ul = stock.get("underlying", "")
-        if itype == "futures":
-            st.info(
-                f"**{ul} Futures — {stock.get('exp_label', '')}**  ·  "
-                "NSE F&O historical data is not available via Yahoo Finance. "
-                f"Showing **{ul} spot index** chart (futures price tracks spot within ~0.1–0.3%)."
-            )
-        elif itype == "options":
-            strike   = stock.get("strike", "")
-            opt_type = stock.get("opt_type", "")
-            intrinsic = max(0, (last_close - strike) if opt_type == "CE" else (strike - last_close))
-            st.info(
-                f"**{ul} {strike} {opt_type} — {stock.get('exp_label', '')}**  ·  "
-                "Individual option price data is not available via Yahoo Finance. "
-                f"Showing **{ul} spot** chart.  "
-                f"Intrinsic value ≈ **{intrinsic:,.0f}** pts  ·  "
-                f"Spot {last_close:,.0f}  ·  ATM {stock.get('atm', '')}  ·  "
-                f"{'ITM' if intrinsic > 0 else 'OTM'}"
-            )
-
-    # ── Live NSE option chain (options mode) ──────────────────────────────────────
-    if itype == "options":
-        ul = stock.get("underlying", "")
-        with st.expander("📊  Live NSE Option Chain", expanded=True):
-            with st.spinner("Fetching NSE option chain…"):
-                oc_df = fetch_nse_option_chain(ul)
-
-            if oc_df is None:
-                st.caption("Could not fetch NSE option chain. NSE may be closed or blocking the request.")
-            else:
-                spot_val   = stock.get("spot", last_close)
-                sel_strike = stock.get("strike", 0)
-                sel_type   = stock.get("opt_type", "CE")
-                step       = _FNO_UNDERLYINGS.get(ul, {}).get("step", 50)
-                atm_strike = round(spot_val / step) * step
-
-                # Show strikes ±10 from ATM
-                nearby = oc_df[abs(oc_df["Strike"] - atm_strike) <= step * 10]
-
-                # Split CE and PE side by side
-                ce_df = nearby[nearby["Type"] == "CE"].drop(columns="Type").set_index("Strike")
-                pe_df = nearby[nearby["Type"] == "PE"].drop(columns="Type").set_index("Strike")
-
-                def _oc_style(df, side):
-                    def _row(row):
-                        strike = row.name
-                        styles = [""] * len(row)
-                        if strike == atm_strike:
-                            styles = ["background-color:#fff8dc; font-weight:600"] * len(row)
-                        elif (side == "CE" and strike == sel_strike and sel_type == "CE") or \
-                             (side == "PE" and strike == sel_strike and sel_type == "PE"):
-                            styles = ["background-color:#e8f0fd; font-weight:600"] * len(row)
-                        return styles
-                    return df.style.apply(_row, axis=1)
-
-                st.caption(f"Spot: **{spot_val:,.0f}**  ·  ATM: **{atm_strike}**  ·  Selected: **{sel_strike} {sel_type}**  ·  Yellow = ATM  ·  Blue = selected strike")
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**Calls (CE)**")
-                    st.dataframe(_oc_style(ce_df, "CE"), width="stretch", height=380)
-                with c2:
-                    st.markdown("**Puts (PE)**")
-                    st.dataframe(_oc_style(pe_df, "PE"), width="stretch", height=380)
-
-
-    # ════════════════════════════════════════════════════════════════════════════
-    # SECTION 2 — BIAS SUMMARY  (above chart so it's the first thing you see)
-    # ════════════════════════════════════════════════════════════════════════════
-
-    BIAS_META = {
-        "BULLISH": ("bias-bullish", "bias-bull-txt", "📈", "Most indicators bullish right now"),
-        "BEARISH": ("bias-bearish", "bias-bear-txt", "📉", "Most indicators bearish right now"),
-        "NEUTRAL": ("bias-neutral", "bias-neut-txt", "➡️", "Mixed signals — no clear direction"),
-    }
-    panel_cls, txt_cls, icon, desc = BIAS_META[bias]
-
-    # Count signals by type
-    buy_count   = sum(1 for s in signals if s["type"] == "BUY")
-    sell_count  = sum(1 for s in signals if s["type"] == "SELL")
-    watch_count = sum(1 for s in signals if s["type"] == "WATCH")
-
-    badges = ""
-    if buy_count:   badges += f'<span class="signal-badge badge-buy">▲ {buy_count} BUY</span>'
-    if sell_count:  badges += f'<span class="signal-badge badge-sell">▼ {sell_count} SELL</span>'
-    if watch_count: badges += f'<span class="signal-badge badge-watch">◆ {watch_count} WATCH</span>'
-    if not badges:  badges  = '<span style="color:#555; font-size:0.82rem;">No active signals</span>'
-
-    adx_val = float(df_enriched["adx"].iloc[-1]) if "adx" in df_enriched.columns and pd.notna(df_enriched["adx"].iloc[-1]) else None
-    _regime_meta = {
-        "TRENDING": ("🔥 TRENDING", "#1a5aad", "#e8f0fd"),
-        "RANGING":  ("〰 RANGING",  "#b8860b", "#fff8e1"),
-        "MIXED":    ("⚡ MIXED",    "#555",    "#f5f5f5"),
-    }
-    regime_lbl, regime_color, regime_bg = _regime_meta.get(regime, _regime_meta["MIXED"])
-    adx_note = f"ADX {adx_val:.1f}" if adx_val is not None else "ADX —"
-    score_display = f"{score:+.1f}"
-
-    st.html(f"""
-    <div class="bias-panel {panel_cls}">
-      <div style="font-size:2rem; line-height:1;">{icon}</div>
-      <div style="flex:1;">
-        <div class="bias-label {txt_cls}">{bias}</div>
-        <div class="bias-score">{desc}  ·  Score: {score_display}</div>
-        <div style="margin-top:6px;">
-          <span style="display:inline-block; background:{regime_bg}; color:{regime_color};
-                       border:1px solid {regime_color}; border-radius:4px;
-                       padding:2px 8px; font-size:0.75rem; font-weight:600;
-                       margin-right:8px;">{regime_lbl} &nbsp;·&nbsp; {adx_note}</span>
-        </div>
-        <div style="margin-top:8px;">{badges}</div>
-      </div>
-    </div>
-    """)
-
-
-    # ════════════════════════════════════════════════════════════════════════════
-    # SECTION 3 — CHART
-    # ════════════════════════════════════════════════════════════════════════════
-
-    indicators_config = {
-        "ema":        ind_ema,
-        "bb":         ind_bb,
-        "vwap":       ind_vwap and timeframe in ("5m", "15m", "1h"),
-        "rsi":        ind_rsi,
-        "macd":       ind_macd,
-        "stoch":      ind_stoch,
-        "supertrend": ind_supertrend,
-        "donchian":   ind_donchian,
-        "atr":        False,
-    }
-
-    # Only show the 3 closest S/R levels on the chart to avoid clutter
-    chart_sr = sorted(sr_levels, key=lambda x: abs(x["level"] - last_close))[:3]
-    fig = _cached_build_chart(df_enriched, indicators_config, chart_sr,
-                              _chart_signals_deduped(signals),
-                              timeframe=timeframe)
-    st.html('<div class="chart-wrapper">')
-    st.plotly_chart(
-        fig,
-        width="stretch",
-        config={
-            "scrollZoom": True,           # mouse-wheel zoom on the chart
-            "displayModeBar": True,
-            "modeBarButtonsToRemove": [   # keep toolbar clean
-                "select2d", "lasso2d", "autoScale2d",
-            ],
-            "toImageButtonOptions": {
-                "filename": stock["symbol"],
-                "scale": 2,
-            },
-        },
-    )
-    st.html('</div>')
-
-
-    # ════════════════════════════════════════════════════════════════════════════
-    # SECTION 3b — OPTIONS STRATEGY + CHAIN
-    # ════════════════════════════════════════════════════════════════════════════
-
-    if itype == "options":
-        atr_pct_now = (float(df_enriched["atr"].iloc[-1]) / last_close
-                       if "atr" in df_enriched.columns and pd.notna(df_enriched["atr"].iloc[-1])
-                       else 0.01)
-        opt_strat = _options_strategy(bias, regime, atr_pct_now)
-        _strat_bg  = {"📈": "#e8f5ec", "📉": "#fdecea", "💥": "#f0e8ff",
-                      "💰": "#fff8e1", "🪤": "#e8f0fd", "📊": "#e8f0fd",
-                      "🎯": "#fff8e1", "⏳": "#f5f5f5", "🕐": "#f5f5f5"}
-        _strat_bd  = {"📈": "#1a7a3c", "📉": "#c0392b", "💥": "#7c3aed",
-                      "💰": "#b8860b", "🪤": "#1a5aad", "📊": "#1a5aad",
-                      "🎯": "#b8860b", "⏳": "#888",    "🕐": "#888"}
-        sb  = _strat_bg.get(opt_strat["emoji"], "#f5f5f5")
-        sbd = _strat_bd.get(opt_strat["emoji"], "#aaa")
-        adx_disp = f"{float(df_enriched['adx'].iloc[-1]):.1f}" if "adx" in df_enriched.columns else "—"
+        chg_cls   = "header-up" if is_up else "header-down"
+        chg_arrow = "▲" if is_up else "▼"
+        pfx       = "" if itype in ("index", "currency") else "₹"
 
         st.html(f"""
-    <div style="background:{sb}; border:1.5px solid {sbd}; border-radius:10px;
-                padding:16px 20px; margin:12px 0;">
-      <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
-        <span style="font-size:1.6rem;">{opt_strat['emoji']}</span>
-        <span style="font-size:1.1rem; font-weight:700; color:{sbd};">
-          {opt_strat['strategy']}
-        </span>
-        <span style="margin-left:auto; font-size:0.75rem; color:#555;">
-          Regime: <b>{regime}</b> (ADX {adx_disp}) · Bias: <b>{bias}</b>
-        </span>
-      </div>
-      <div style="font-size:0.85rem; font-family:monospace; background:rgba(0,0,0,0.04);
-                  padding:6px 10px; border-radius:4px; margin-bottom:8px;">
-        {opt_strat['legs']}
-      </div>
-      <div style="font-size:0.82rem; color:#333; margin-bottom:4px;">
-        <b>Why:</b> {opt_strat['rationale']}
-      </div>
-      <div style="font-size:0.78rem; color:#888;">
-        <b>Risk:</b> {opt_strat['risk']}
-      </div>
-    </div>
-    """)
+        <div class="header-card">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:12px;">
+            <div>
+              <p class="header-symbol">{stock['symbol']}&nbsp;&nbsp;{_itype_badge(itype)}</p>
+              <p class="header-name">{stock['name']}  ·  {stock['exchange']}  ·  {stock['cap'].upper()}</p>
+            </div>
+            <div style="text-align:right;">
+              <p class="header-price">{pfx}{last_close:,.2f}</p>
+              <p class="{chg_cls}">{chg_arrow} {abs(change_pct):.2f}%&nbsp;&nbsp;{change_abs:+.2f}</p>
+              <p style="font-size:0.7rem; color:#aaa; margin:0;">Last traded price · NSE official close may differ slightly</p>
+            </div>
+          </div>
+        </div>
+        """)
 
-    if itype in ("stock", "index", "options"):
-        with st.expander("🎯  Options Chain", expanded=(itype == "options")):
-            _lookup = stock["yf_ticker"]
-            opt_data = fetch_options_chain(_lookup)
 
-            if opt_data is None:
-                st.caption(
-                    "Options data not available for this instrument via yfinance. "
-                    "Indian NSE options data requires a direct NSE API session. "
-                    "Try entering a US-listed ticker (e.g. AAPL) to see a sample chain."
+        # ── Key stats pills ───────────────────────────────────────────────────────────
+
+        def _pill(label: str, value: str) -> str:
+            return (f'<div class="stat-pill">'
+                    f'<div class="label">{label}</div>'
+                    f'<div class="value">{value}</div>'
+                    f'</div>')
+
+        hi52  = info.get("fiftyTwoWeekHigh")
+        lo52  = info.get("fiftyTwoWeekLow")
+        mc    = info.get("marketCap")
+        pe    = info.get("trailingPE")
+        beta  = info.get("beta")
+        avgv  = info.get("averageVolume")
+
+        pills = [
+            _pill("Day High",  _fmt_price(day_high)),
+            _pill("Day Low",   _fmt_price(day_low)),
+            _pill("Volume",    _fmt_vol(volume)),
+            _pill("52W High",  _fmt_price(hi52)),
+            _pill("52W Low",   _fmt_price(lo52)),
+            _pill("Mkt Cap",   f"₹{mc/1e7:.0f} Cr" if mc else "—"),
+            _pill("P/E",       f"{pe:.1f}" if pe and pe < 5000 else "—"),
+            _pill("Beta",      f"{beta:.2f}" if beta else "—"),
+            _pill("Avg Vol",   _fmt_vol(int(avgv)) if avgv else "—"),
+        ]
+
+        st.html(f'<div class="stats-row">{"".join(pills)}</div>')
+
+        # ── F&O info banner ───────────────────────────────────────────────────────────
+        if _fno_fallback_used:
+            ul = stock.get("underlying", "")
+            if itype == "futures":
+                st.info(
+                    f"**{ul} Futures — {stock.get('exp_label', '')}**  ·  "
+                    "NSE F&O historical data is not available via Yahoo Finance. "
+                    f"Showing **{ul} spot index** chart (futures price tracks spot within ~0.1–0.3%)."
                 )
-            else:
-                COLS = ["strike", "lastPrice", "bid", "ask", "volume",
-                        "openInterest", "impliedVolatility", "inTheMoney"]
-
-                exp_choice = st.selectbox(
-                    "Expiry", opt_data["expirations"],
-                    label_visibility="collapsed", key="opt_exp",
+            elif itype == "options":
+                strike   = stock.get("strike", "")
+                opt_type = stock.get("opt_type", "")
+                intrinsic = max(0, (last_close - strike) if opt_type == "CE" else (strike - last_close))
+                st.info(
+                    f"**{ul} {strike} {opt_type} — {stock.get('exp_label', '')}**  ·  "
+                    "Individual option price data is not available via Yahoo Finance. "
+                    f"Showing **{ul} spot** chart.  "
+                    f"Intrinsic value ≈ **{intrinsic:,.0f}** pts  ·  "
+                    f"Spot {last_close:,.0f}  ·  ATM {stock.get('atm', '')}  ·  "
+                    f"{'ITM' if intrinsic > 0 else 'OTM'}"
                 )
-                if exp_choice != opt_data["expirations"][0]:
-                    try:
-                        ch = yf.Ticker(_lookup).option_chain(exp_choice)
-                        calls, puts = ch.calls, ch.puts
-                    except Exception:
-                        calls, puts = opt_data["calls"], opt_data["puts"]
+
+        # ── Live NSE option chain (options mode) ──────────────────────────────────────
+        if itype == "options":
+            ul = stock.get("underlying", "")
+            with st.expander("📊  Live NSE Option Chain", expanded=True):
+                with st.spinner("Fetching NSE option chain…"):
+                    oc_df = fetch_nse_option_chain(ul)
+
+                if oc_df is None:
+                    st.caption("Could not fetch NSE option chain. NSE may be closed or blocking the request.")
                 else:
-                    calls, puts = opt_data["calls"], opt_data["puts"]
+                    spot_val   = stock.get("spot", last_close)
+                    sel_strike = stock.get("strike", 0)
+                    sel_type   = stock.get("opt_type", "CE")
+                    step       = _FNO_UNDERLYINGS.get(ul, {}).get("step", 50)
+                    atm_strike = round(spot_val / step) * step
 
-                c_cols = [x for x in COLS if x in calls.columns]
-                p_cols = [x for x in COLS if x in puts.columns]
+                    # Show strikes ±10 from ATM
+                    nearby = oc_df[abs(oc_df["Strike"] - atm_strike) <= step * 10]
 
-                oc1, oc2 = st.columns(2)
-                with oc1:
-                    st.markdown("**Calls**")
-                    def _call_style(v):
-                        return "background-color:#e8f5ec" if v is True else ""
-                    style_calls = calls[c_cols].style
-                    if "inTheMoney" in c_cols:
-                        style_calls = style_calls.applymap(_call_style, subset=["inTheMoney"])
-                    st.dataframe(style_calls, hide_index=True, width="stretch", height=280)
-                with oc2:
-                    st.markdown("**Puts**")
-                    def _put_style(v):
-                        return "background-color:#fdecea" if v is True else ""
-                    style_puts = puts[p_cols].style
-                    if "inTheMoney" in p_cols:
-                        style_puts = style_puts.applymap(_put_style, subset=["inTheMoney"])
-                    st.dataframe(style_puts, hide_index=True, width="stretch", height=280)
+                    # Split CE and PE side by side
+                    ce_df = nearby[nearby["Type"] == "CE"].drop(columns="Type").set_index("Strike")
+                    pe_df = nearby[nearby["Type"] == "PE"].drop(columns="Type").set_index("Strike")
+
+                    def _oc_style(df, side):
+                        def _row(row):
+                            strike = row.name
+                            styles = [""] * len(row)
+                            if strike == atm_strike:
+                                styles = ["background-color:#fff8dc; font-weight:600"] * len(row)
+                            elif (side == "CE" and strike == sel_strike and sel_type == "CE") or \
+                                 (side == "PE" and strike == sel_strike and sel_type == "PE"):
+                                styles = ["background-color:#e8f0fd; font-weight:600"] * len(row)
+                            return styles
+                        return df.style.apply(_row, axis=1)
+
+                    st.caption(f"Spot: **{spot_val:,.0f}**  ·  ATM: **{atm_strike}**  ·  Selected: **{sel_strike} {sel_type}**  ·  Yellow = ATM  ·  Blue = selected strike")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**Calls (CE)**")
+                        st.dataframe(_oc_style(ce_df, "CE"), width="stretch", height=380)
+                    with c2:
+                        st.markdown("**Puts (PE)**")
+                        st.dataframe(_oc_style(pe_df, "PE"), width="stretch", height=380)
 
 
-    # ════════════════════════════════════════════════════════════════════════════
-    # SECTION 4 — INSIGHTS  (signals + S/R side by side)
-    # ════════════════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════════════
+        # SECTION 2 — BIAS SUMMARY  (above chart so it's the first thing you see)
+        # ════════════════════════════════════════════════════════════════════════════
 
-    col_sig, col_sr = st.columns([1, 1], gap="large")
+        BIAS_META = {
+            "BULLISH": ("bias-bullish", "bias-bull-txt", "📈", "Most indicators bullish right now"),
+            "BEARISH": ("bias-bearish", "bias-bear-txt", "📉", "Most indicators bearish right now"),
+            "NEUTRAL": ("bias-neutral", "bias-neut-txt", "➡️", "Mixed signals — no clear direction"),
+        }
+        panel_cls, txt_cls, icon, desc = BIAS_META[bias]
 
-    # ── Trade Setups ──────────────────────────────────────────────────────────────
-    with col_sig:
-        st.html('<p class="section-header">Trade Setups</p>')
+        # Count signals by type
+        buy_count   = sum(1 for s in signals if s["type"] == "BUY")
+        sell_count  = sum(1 for s in signals if s["type"] == "SELL")
+        watch_count = sum(1 for s in signals if s["type"] == "WATCH")
 
-        setups = _build_trade_setups(signals, df_enriched, bias)
-        pfx_s  = "" if itype in ("index", "currency") else "₹"
+        badges = ""
+        if buy_count:   badges += f'<span class="signal-badge badge-buy">▲ {buy_count} BUY</span>'
+        if sell_count:  badges += f'<span class="signal-badge badge-sell">▼ {sell_count} SELL</span>'
+        if watch_count: badges += f'<span class="signal-badge badge-watch">◆ {watch_count} WATCH</span>'
+        if not badges:  badges  = '<span style="color:#555; font-size:0.82rem;">No active signals</span>'
 
-        if not setups:
-            no_msg = {
-                "BULLISH": "No BUY setups in the last 20 bars.",
-                "BEARISH": "No SELL setups in the last 20 bars.",
-                "NEUTRAL": "No trade setups in the last 20 bars.",
-            }.get(bias, "No trade setups found.")
-            st.html(f'<p style="color:#555; font-size:0.85rem;">{no_msg}</p>')
-        else:
-            for setup in setups:
-                is_buy   = setup["type"] == "BUY"
-                dir_cls  = "setup-buy" if is_buy else "setup-sell"
-                dir_lbl  = "▲ BUY" if is_buy else "▼ SELL"
-                dir_tcls = "setup-dir-buy" if is_buy else "setup-dir-sell"
-                date_str = (setup["date"].strftime("%d %b %Y")
-                            if hasattr(setup["date"], "strftime") else str(setup["date"]))
+        adx_val = float(df_enriched["adx"].iloc[-1]) if "adx" in df_enriched.columns and pd.notna(df_enriched["adx"].iloc[-1]) else None
+        _regime_meta = {
+            "TRENDING": ("🔥 TRENDING", "#1a5aad", "#e8f0fd"),
+            "RANGING":  ("〰 RANGING",  "#b8860b", "#fff8e1"),
+            "MIXED":    ("⚡ MIXED",    "#555",    "#f5f5f5"),
+        }
+        regime_lbl, regime_color, regime_bg = _regime_meta.get(regime, _regime_meta["MIXED"])
+        adx_note = f"ADX {adx_val:.1f}" if adx_val is not None else "ADX —"
+        score_display = f"{score:+.1f}"
 
-                sl_color  = "setup-red"  if is_buy else "setup-green"
-                tgt_color = "setup-green" if is_buy else "setup-red"
+        st.html(f"""
+        <div class="bias-panel {panel_cls}">
+          <div style="font-size:2rem; line-height:1;">{icon}</div>
+          <div style="flex:1;">
+            <div class="bias-label {txt_cls}">{bias}</div>
+            <div class="bias-score">{desc}  ·  Score: {score_display}</div>
+            <div style="margin-top:6px;">
+              <span style="display:inline-block; background:{regime_bg}; color:{regime_color};
+                           border:1px solid {regime_color}; border-radius:4px;
+                           padding:2px 8px; font-size:0.75rem; font-weight:600;
+                           margin-right:8px;">{regime_lbl} &nbsp;·&nbsp; {adx_note}</span>
+            </div>
+            <div style="margin-top:8px;">{badges}</div>
+          </div>
+        </div>
+        """)
 
-                tags_html = "".join(f'<span class="setup-tag">{ind}</span>'
-                                    for ind in setup["indicators"])
-                n         = setup["n_signals"]
-                conviction = setup.get("conviction", "MEDIUM")
-                conv_color = {"HIGH": "#1a7a3c", "MEDIUM": "#b8860b", "LOW": "#888"}.get(conviction, "#888")
-                conv_icon  = {"HIGH": "●●●", "MEDIUM": "●●○", "LOW": "●○○"}.get(conviction, "●○○")
-                sig_note  = f"{n} signal{'s' if n>1 else ''}" if n else "Bias only"
 
-                st.html(f"""
-    <div class="setup-card {dir_cls}">
-      <div class="setup-header">
-        <span class="{dir_tcls}">{dir_lbl}</span>
-        <span class="setup-date">{date_str} &nbsp;·&nbsp; {sig_note}</span>
-        <span style="margin-left:auto; font-size:0.72rem; font-weight:600; color:{conv_color};">{conv_icon} {conviction}</span>
-      </div>
-      <div class="setup-grid">
-        <span class="setup-lbl">Entry</span>
-        <span class="setup-val">{pfx_s}{setup['entry']:,.2f}</span>
-        <span></span>
+        # ════════════════════════════════════════════════════════════════════════════
+        # SECTION 3 — CHART
+        # ════════════════════════════════════════════════════════════════════════════
 
-        <span class="setup-lbl">Stop</span>
-        <span class="setup-val {sl_color}">{pfx_s}{setup['sl']:,.2f}</span>
-        <span class="setup-chg {sl_color}">{setup['sl_diff']:+.2f} ({setup['sl_pct']:+.1f}%)</span>
+        indicators_config = {
+            "ema":        ind_ema,
+            "bb":         ind_bb,
+            "vwap":       ind_vwap and timeframe in ("5m", "15m", "1h"),
+            "rsi":        ind_rsi,
+            "macd":       ind_macd,
+            "stoch":      ind_stoch,
+            "supertrend": ind_supertrend,
+            "donchian":   ind_donchian,
+            "atr":        False,
+        }
 
-        <span class="setup-lbl">Target</span>
-        <span class="setup-val {tgt_color}">{pfx_s}{setup['target']:,.2f}</span>
-        <span class="setup-chg {tgt_color}">{setup['tgt_diff']:+.2f} ({setup['tgt_pct']:+.1f}%)</span>
-      </div>
-      <span class="setup-rr">R:R &nbsp; 1 : {setup['rr']}</span>
-      <div class="setup-tags">{tags_html}</div>
-    </div>""")
+        # Only show the 3 closest S/R levels on the chart to avoid clutter
+        chart_sr = sorted(sr_levels, key=lambda x: abs(x["level"] - last_close))[:3]
+        fig = _cached_build_chart(df_enriched, indicators_config, chart_sr,
+                                  _chart_signals_deduped(signals),
+                                  timeframe=timeframe)
+        st.html('<div class="chart-wrapper">')
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            config={
+                "scrollZoom": True,           # mouse-wheel zoom on the chart
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": [   # keep toolbar clean
+                    "select2d", "lasso2d", "autoScale2d",
+                ],
+                "toImageButtonOptions": {
+                    "filename": stock["symbol"],
+                    "scale": 2,
+                },
+            },
+        )
+        st.html('</div>')
 
-            # ── Per-setup how-to guide ─────────────────────────────────────────
-            is_buy_g = setup["type"] == "BUY"
-            action   = "BUY (go long)" if is_buy_g else "SELL SHORT"
-            num_cls  = "" if is_buy_g else "sell-num"
-            e_p      = f"{pfx_s}{setup['entry']:,.2f}"
-            sl_p     = f"{pfx_s}{setup['sl']:,.2f}"
-            tg_p     = f"{pfx_s}{setup['target']:,.2f}"
-            sl_risk  = abs(setup['sl_diff'])
-            budget   = 100_000
-            est_shares = max(1, int(budget * 0.95 / setup["entry"]))
-            est_risk   = round(est_shares * sl_risk, 2)
-            est_reward = round(est_shares * abs(setup["tgt_diff"]), 2)
 
-            if is_buy_g:
-                step3_txt = (f"Set a <span class='guide-red'>stop-loss order at {sl_p}</span> "
-                             f"the moment you enter. This limits your loss to ≈ {pfx_s}{est_risk:,.0f}.")
-                step4_txt = (f"Set a <span class='guide-green'>limit sell order at {tg_p}</span> "
-                             f"to lock in ≈ {pfx_s}{est_reward:,.0f} profit automatically.")
-                step5_txt = ("If price moves up strongly but hasn't hit the target yet, "
-                             "consider moving your stop-loss up to your entry price to make it a risk-free trade.")
-            else:
-                step3_txt = (f"Set a <span class='guide-red'>buy-to-cover stop at {sl_p}</span> "
-                             f"to cap your loss at ≈ {pfx_s}{est_risk:,.0f}.")
-                step4_txt = (f"Set a <span class='guide-green'>limit buy-back order at {tg_p}</span> "
-                             f"to bank ≈ {pfx_s}{est_reward:,.0f} profit.")
-                step5_txt = ("If price falls fast toward the target, trail your stop down to entry "
-                             "so you can't lose money on the trade.")
+        # ════════════════════════════════════════════════════════════════════════════
+        # SECTION 3b — OPTIONS STRATEGY + CHAIN
+        # ════════════════════════════════════════════════════════════════════════════
+
+        if itype == "options":
+            atr_pct_now = (float(df_enriched["atr"].iloc[-1]) / last_close
+                           if "atr" in df_enriched.columns and pd.notna(df_enriched["atr"].iloc[-1])
+                           else 0.01)
+            opt_strat = _options_strategy(bias, regime, atr_pct_now)
+            _strat_bg  = {"📈": "#e8f5ec", "📉": "#fdecea", "💥": "#f0e8ff",
+                          "💰": "#fff8e1", "🪤": "#e8f0fd", "📊": "#e8f0fd",
+                          "🎯": "#fff8e1", "⏳": "#f5f5f5", "🕐": "#f5f5f5"}
+            _strat_bd  = {"📈": "#1a7a3c", "📉": "#c0392b", "💥": "#7c3aed",
+                          "💰": "#b8860b", "🪤": "#1a5aad", "📊": "#1a5aad",
+                          "🎯": "#b8860b", "⏳": "#888",    "🕐": "#888"}
+            sb  = _strat_bg.get(opt_strat["emoji"], "#f5f5f5")
+            sbd = _strat_bd.get(opt_strat["emoji"], "#aaa")
+            adx_disp = f"{float(df_enriched['adx'].iloc[-1]):.1f}" if "adx" in df_enriched.columns else "—"
 
             st.html(f"""
-    <div class="guide-box">
-      <div class="guide-step">
-        <div class="guide-num {num_cls}">1</div>
-        <div class="guide-text">
-          <b>Confirm the bias</b> — the panel above says <b>{bias}</b>.
-          Only take <b>{setup["type"]}</b> trades when the bias agrees.
-          If the bias changes, skip this setup.
+        <div style="background:{sb}; border:1.5px solid {sbd}; border-radius:10px;
+                    padding:16px 20px; margin:12px 0;">
+          <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
+            <span style="font-size:1.6rem;">{opt_strat['emoji']}</span>
+            <span style="font-size:1.1rem; font-weight:700; color:{sbd};">
+              {opt_strat['strategy']}
+            </span>
+            <span style="margin-left:auto; font-size:0.75rem; color:#555;">
+              Regime: <b>{regime}</b> (ADX {adx_disp}) · Bias: <b>{bias}</b>
+            </span>
+          </div>
+          <div style="font-size:0.85rem; font-family:monospace; background:rgba(0,0,0,0.04);
+                      padding:6px 10px; border-radius:4px; margin-bottom:8px;">
+            {opt_strat['legs']}
+          </div>
+          <div style="font-size:0.82rem; color:#333; margin-bottom:4px;">
+            <b>Why:</b> {opt_strat['rationale']}
+          </div>
+          <div style="font-size:0.78rem; color:#888;">
+            <b>Risk:</b> {opt_strat['risk']}
+          </div>
         </div>
-      </div>
-      <div class="guide-step">
-        <div class="guide-num {num_cls}">2</div>
-        <div class="guide-text">
-          <b>Enter the trade</b> — place a <b>{action}</b> order at
-          <span class="guide-price">{e_p}</span>.
-          With ₹1,00,000 capital you can buy ≈ <b>{est_shares} shares</b> (95% deployed).
-        </div>
-      </div>
-      <div class="guide-step">
-        <div class="guide-num {num_cls}">3</div>
-        <div class="guide-text">{step3_txt}</div>
-      </div>
-      <div class="guide-step">
-        <div class="guide-num {num_cls}">4</div>
-        <div class="guide-text">{step4_txt}</div>
-      </div>
-      <div class="guide-step">
-        <div class="guide-num {num_cls}">5</div>
-        <div class="guide-text">{step5_txt}</div>
-      </div>
-      <div class="guide-rule">
-        ⚠️ <b>Golden rule:</b> Never risk more than 2% of your total capital on a single trade.
-        At ₹1,00,000 that is ₹2,000 max risk per trade.
-        If the stop-loss distance implies more than that, reduce your position size accordingly.
-      </div>
-    </div>""")
+        """)
 
-    # ── Support & Resistance ──────────────────────────────────────────────────────
-    with col_sr:
-        st.html('<p class="section-header">Support &amp; Resistance</p>')
+        if itype in ("stock", "index", "options"):
+            with st.expander("🎯  Options Chain", expanded=(itype == "options")):
+                _lookup = stock["yf_ticker"]
+                opt_data = fetch_options_chain(_lookup)
 
-        if not sr_levels:
-            st.html('<p style="color:#555; font-size:0.85rem;">Enable S/R options in the sidebar.</p>')
-        else:
-            TYPE_ROW = {"resistance": "sr-res", "support": "sr-sup", "pivot": "sr-piv"}
-            TYPE_COL = {"resistance": "#f85149", "support": "#3fb950", "pivot": "#bc8cff"}
+                if opt_data is None:
+                    st.caption(
+                        "Options data not available for this instrument via yfinance. "
+                        "Indian NSE options data requires a direct NSE API session. "
+                        "Try entering a US-listed ticker (e.g. AAPL) to see a sample chain."
+                    )
+                else:
+                    COLS = ["strike", "lastPrice", "bid", "ask", "volume",
+                            "openInterest", "impliedVolatility", "inTheMoney"]
 
-            # Sort: resistances above current price (desc), then supports below (desc)
-            above = sorted([l for l in sr_levels if l["level"] > last_close],
-                           key=lambda x: x["level"])
-            below = sorted([l for l in sr_levels if l["level"] <= last_close],
-                           key=lambda x: x["level"], reverse=True)
+                    exp_choice = st.selectbox(
+                        "Expiry", opt_data["expirations"],
+                        label_visibility="collapsed", key="opt_exp",
+                    )
+                    if exp_choice != opt_data["expirations"][0]:
+                        try:
+                            ch = yf.Ticker(_lookup).option_chain(exp_choice)
+                            calls, puts = ch.calls, ch.puts
+                        except Exception:
+                            calls, puts = opt_data["calls"], opt_data["puts"]
+                    else:
+                        calls, puts = opt_data["calls"], opt_data["puts"]
 
-            for lv in (above + below)[:12]:
-                dist     = (lv["level"] - last_close) / last_close * 100
-                row_cls  = TYPE_ROW.get(lv["type"], "")
-                col      = TYPE_COL.get(lv["type"], "#8b949e")
-                dist_col = "#3fb950" if dist > 0 else "#f85149"
-                st.html(f"""
-    <div class="sr-row {row_cls}">
-      <div>
-        <div class="sr-label">{lv['label']}</div>
-        <div class="sr-price">{pfx}{lv['level']:,.2f}</div>
-      </div>
-      <div style="text-align:right;">
-        <div class="sr-dist" style="color:{dist_col};">{dist:+.2f}%</div>
-        <div class="sr-label" style="color:{col}; text-transform:capitalize;">{lv['type']}</div>
-      </div>
-    </div>""")
+                    c_cols = [x for x in COLS if x in calls.columns]
+                    p_cols = [x for x in COLS if x in puts.columns]
+
+                    oc1, oc2 = st.columns(2)
+                    with oc1:
+                        st.markdown("**Calls**")
+                        def _call_style(v):
+                            return "background-color:#e8f5ec" if v is True else ""
+                        style_calls = calls[c_cols].style
+                        if "inTheMoney" in c_cols:
+                            style_calls = style_calls.applymap(_call_style, subset=["inTheMoney"])
+                        st.dataframe(style_calls, hide_index=True, width="stretch", height=280)
+                    with oc2:
+                        st.markdown("**Puts**")
+                        def _put_style(v):
+                            return "background-color:#fdecea" if v is True else ""
+                        style_puts = puts[p_cols].style
+                        if "inTheMoney" in p_cols:
+                            style_puts = style_puts.applymap(_put_style, subset=["inTheMoney"])
+                        st.dataframe(style_puts, hide_index=True, width="stretch", height=280)
 
 
-    # ════════════════════════════════════════════════════════════════════════════
-    # SECTION 5 — DETAILS  (advanced / expandable)
-    # ════════════════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════════════
+        # SECTION 4 — INSIGHTS  (signals + S/R side by side)
+        # ════════════════════════════════════════════════════════════════════════════
 
-    st.html('<hr class="thin-divider">')
+        col_sig, col_sr = st.columns([1, 1], gap="large")
 
-    with st.expander("📊  Indicator Values  —  last bar"):
-        last     = df_enriched.iloc[-1]
-        ind_cols = [
-            ("RSI",         "rsi"),
-            ("MACD Line",   "macd_line"),
-            ("MACD Signal", "macd_signal"),
-            ("MACD Hist",   "macd_hist"),
-            ("EMA 9",       "ema_9"),
-            ("EMA 21",      "ema_21"),
-            ("EMA 50",      "ema_50"),
-            ("EMA 200",     "ema_200"),
-            ("BB Upper",    "bb_upper"),
-            ("BB Mid",      "bb_mid"),
-            ("BB Lower",    "bb_lower"),
-            ("VWAP",        "vwap"),
-            ("ATR",         "atr"),
-            ("Stoch K",      "stoch_k"),
-            ("Stoch D",      "stoch_d"),
-            ("Supertrend",   "supertrend"),
-            ("ST Direction", "st_direction"),
-            ("DC Upper",     "dc_upper"),
-            ("DC Mid",       "dc_mid"),
-            ("DC Lower",     "dc_lower"),
-        ]
-        rows = []
-        for label, col in ind_cols:
-            if col in df_enriched.columns:
-                v = last.get(col, np.nan)
-                rows.append({"Indicator": label,
-                             "Value": f"{v:.4f}" if pd.notna(v) else "—"})
+        # ── Trade Setups ──────────────────────────────────────────────────────────────
+        with col_sig:
+            st.html('<p class="section-header">Trade Setups</p>')
 
-        c1, c2 = st.columns(2)
-        half = len(rows) // 2
-        with c1:
-            st.dataframe(pd.DataFrame(rows[:half]),  hide_index=True, width="stretch")
-        with c2:
-            st.dataframe(pd.DataFrame(rows[half:]), hide_index=True, width="stretch")
+            setups = _build_trade_setups(signals, df_enriched, bias)
+            pfx_s  = "" if itype in ("index", "currency") else "₹"
 
-    with st.expander("📋  All Raw Signals  —  every indicator that fired"):
-        if signals:
-            sig_rows = []
-            for s in signals:
-                date_str = (s["date"].strftime("%d %b %Y  %H:%M")
-                            if hasattr(s["date"], "strftime") else str(s["date"]))
-                sig_rows.append({
-                    "Type":        s["type"],
-                    "Indicator":   s["indicator"],
-                    "Description": s["description"],
-                    "Strength":    _strength_dots(s["strength"]),
-                    "Date":        date_str,
-                })
-            sig_df = pd.DataFrame(sig_rows)
-            def _sig_bg(val):
-                if val == "BUY":   return "background-color:#e8f5ec; color:#1a7a3c; font-weight:bold"
-                if val == "SELL":  return "background-color:#fdecea; color:#c0392b; font-weight:bold"
-                return "background-color:#fff8e1; color:#b8860b; font-weight:bold"
-            st.dataframe(sig_df.style.applymap(_sig_bg, subset=["Type"]),
-                         hide_index=True, width="stretch")
-        else:
-            st.info("No signals in the current window.")
-
-    with st.expander("💰  Signal Backtest  —  simulate trades with real capital"):
-        st.caption(
-            "Simulates every signal where 3+ indicators agree. "
-            "Entry = signal-bar close · Stop = 1.5× ATR · Target = 3× ATR · "
-            "Max hold = 20 bars · Position = 95% of available capital."
-        )
-
-        bt_capital = st.number_input(
-            "Starting capital (₹)", value=100_000, step=10_000, min_value=1_000,
-            label_visibility="collapsed",
-            key="bt_cap",
-        )
-
-        if st.button("▶  Run Backtest", type="primary", key="bt_run"):
-            bt_trades, bt_final = _run_backtest(signals, df_enriched, bt_capital)
-
-            if not bt_trades:
-                st.info("No qualifying signals found in this window to backtest.")
+            if not setups:
+                no_msg = {
+                    "BULLISH": "No BUY setups in the last 20 bars.",
+                    "BEARISH": "No SELL setups in the last 20 bars.",
+                    "NEUTRAL": "No trade setups in the last 20 bars.",
+                }.get(bias, "No trade setups found.")
+                st.html(f'<p style="color:#555; font-size:0.85rem;">{no_msg}</p>')
             else:
-                total_pnl  = bt_final - bt_capital
-                wins       = sum(1 for t in bt_trades if t["P&L"] > 0)
-                losses     = len(bt_trades) - wins
-                win_rate   = wins / len(bt_trades) * 100
-                avg_win    = np.mean([t["P&L"] for t in bt_trades if t["P&L"] > 0] or [0])
-                avg_loss   = np.mean([t["P&L"] for t in bt_trades if t["P&L"] <= 0] or [0])
-                pnl_color  = "normal" if total_pnl >= 0 else "inverse"
+                for setup in setups:
+                    is_buy   = setup["type"] == "BUY"
+                    dir_cls  = "setup-buy" if is_buy else "setup-sell"
+                    dir_lbl  = "▲ BUY" if is_buy else "▼ SELL"
+                    dir_tcls = "setup-dir-buy" if is_buy else "setup-dir-sell"
+                    date_str = (setup["date"].strftime("%d %b %Y")
+                                if hasattr(setup["date"], "strftime") else str(setup["date"]))
 
-                # ── Summary metrics ────────────────────────────────────────────
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("Final Capital",  f"{pfx}{bt_final:,.0f}",
-                          f"{total_pnl:+,.0f} ({total_pnl/bt_capital*100:+.1f}%)")
-                m2.metric("Total Trades",   len(bt_trades))
-                m3.metric("Win Rate",       f"{win_rate:.0f}%",
-                          f"{wins}W  {losses}L")
-                m4.metric("Avg Win",        f"{pfx}{avg_win:+,.0f}")
-                m5.metric("Avg Loss",       f"{pfx}{avg_loss:+,.0f}")
+                    sl_color  = "setup-red"  if is_buy else "setup-green"
+                    tgt_color = "setup-green" if is_buy else "setup-red"
 
-                # ── Equity curve ───────────────────────────────────────────────
-                equity = [bt_capital] + [t["Capital After"] for t in bt_trades]
-                eq_df  = pd.DataFrame({
-                    "Trade": range(len(equity)),
-                    "Capital": equity,
-                })
-                eq_fig = go.Figure(go.Scatter(
-                    x=eq_df["Trade"], y=eq_df["Capital"],
-                    mode="lines+markers",
-                    line=dict(color="#1a5aad", width=2),
-                    marker=dict(size=6),
-                    fill="tozeroy",
-                    fillcolor="rgba(26,90,173,0.07)",
-                ))
-                eq_fig.update_layout(
-                    height=220,
-                    margin=dict(l=10, r=10, t=10, b=30),
-                    paper_bgcolor="#fff", plot_bgcolor="#fafafa",
-                    xaxis=dict(title="Trade #", showgrid=True, gridcolor="#e8e8e8"),
-                    yaxis=dict(title="Capital ₹", showgrid=True, gridcolor="#e8e8e8"),
-                    showlegend=False,
-                )
-                st.plotly_chart(eq_fig, width="stretch",
-                                config={"displayModeBar": False})
+                    tags_html = "".join(f'<span class="setup-tag">{ind}</span>'
+                                        for ind in setup["indicators"])
+                    n         = setup["n_signals"]
+                    conviction = setup.get("conviction", "MEDIUM")
+                    conv_color = {"HIGH": "#1a7a3c", "MEDIUM": "#b8860b", "LOW": "#888"}.get(conviction, "#888")
+                    conv_icon  = {"HIGH": "●●●", "MEDIUM": "●●○", "LOW": "●○○"}.get(conviction, "●○○")
+                    sig_note  = f"{n} signal{'s' if n>1 else ''}" if n else "Bias only"
 
-                # ── Trade log table ────────────────────────────────────────────
-                bt_df = pd.DataFrame(bt_trades)
+                    st.html(f"""
+        <div class="setup-card {dir_cls}">
+          <div class="setup-header">
+            <span class="{dir_tcls}">{dir_lbl}</span>
+            <span class="setup-date">{date_str} &nbsp;·&nbsp; {sig_note}</span>
+            <span style="margin-left:auto; font-size:0.72rem; font-weight:600; color:{conv_color};">{conv_icon} {conviction}</span>
+          </div>
+          <div class="setup-grid">
+            <span class="setup-lbl">Entry</span>
+            <span class="setup-val">{pfx_s}{setup['entry']:,.2f}</span>
+            <span></span>
 
-                def _bt_row_style(row):
-                    color = "#e8f5ec" if row["P&L"] > 0 else "#fdecea"
-                    return [f"background-color:{color}"] * len(row)
+            <span class="setup-lbl">Stop</span>
+            <span class="setup-val {sl_color}">{pfx_s}{setup['sl']:,.2f}</span>
+            <span class="setup-chg {sl_color}">{setup['sl_diff']:+.2f} ({setup['sl_pct']:+.1f}%)</span>
 
-                def _result_style(val):
-                    if val in ("Target Hit", "Trail Stop"): return "color:#1a7a3c; font-weight:600"
-                    if val == "Stop Loss":                  return "color:#c0392b; font-weight:600"
-                    return "color:#888"
+            <span class="setup-lbl">Target</span>
+            <span class="setup-val {tgt_color}">{pfx_s}{setup['target']:,.2f}</span>
+            <span class="setup-chg {tgt_color}">{setup['tgt_diff']:+.2f} ({setup['tgt_pct']:+.1f}%)</span>
+          </div>
+          <span class="setup-rr">R:R &nbsp; 1 : {setup['rr']}</span>
+          <div class="setup-tags">{tags_html}</div>
+        </div>""")
 
-                styled = (
-                    bt_df.style
-                    .apply(_bt_row_style, axis=1)
-                    .applymap(_result_style, subset=["Result"])
-                )
-                st.dataframe(styled, hide_index=True, width="stretch")
+                # ── Per-setup how-to guide ─────────────────────────────────────────
+                is_buy_g = setup["type"] == "BUY"
+                action   = "BUY (go long)" if is_buy_g else "SELL SHORT"
+                num_cls  = "" if is_buy_g else "sell-num"
+                e_p      = f"{pfx_s}{setup['entry']:,.2f}"
+                sl_p     = f"{pfx_s}{setup['sl']:,.2f}"
+                tg_p     = f"{pfx_s}{setup['target']:,.2f}"
+                sl_risk  = abs(setup['sl_diff'])
+                budget   = 100_000
+                est_shares = max(1, int(budget * 0.95 / setup["entry"]))
+                est_risk   = round(est_shares * sl_risk, 2)
+                est_reward = round(est_shares * abs(setup["tgt_diff"]), 2)
 
-                # ── Download button ────────────────────────────────────────────
-                ticker_label = stock.get("label", stock.get("ticker", "backtest"))
-                csv_buf = bt_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="⬇  Download Backtest as CSV",
-                    data=csv_buf,
-                    file_name=f"backtest_{ticker_label}_{pd.Timestamp.today().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    help="Download all trades with invested amount, current amount and P&L",
-                )
+                if is_buy_g:
+                    step3_txt = (f"Set a <span class='guide-red'>stop-loss order at {sl_p}</span> "
+                                 f"the moment you enter. This limits your loss to ≈ {pfx_s}{est_risk:,.0f}.")
+                    step4_txt = (f"Set a <span class='guide-green'>limit sell order at {tg_p}</span> "
+                                 f"to lock in ≈ {pfx_s}{est_reward:,.0f} profit automatically.")
+                    step5_txt = ("If price moves up strongly but hasn't hit the target yet, "
+                                 "consider moving your stop-loss up to your entry price to make it a risk-free trade.")
+                else:
+                    step3_txt = (f"Set a <span class='guide-red'>buy-to-cover stop at {sl_p}</span> "
+                                 f"to cap your loss at ≈ {pfx_s}{est_risk:,.0f}.")
+                    step4_txt = (f"Set a <span class='guide-green'>limit buy-back order at {tg_p}</span> "
+                                 f"to bank ≈ {pfx_s}{est_reward:,.0f} profit.")
+                    step5_txt = ("If price falls fast toward the target, trail your stop down to entry "
+                                 "so you can't lose money on the trade.")
+
+                st.html(f"""
+        <div class="guide-box">
+          <div class="guide-step">
+            <div class="guide-num {num_cls}">1</div>
+            <div class="guide-text">
+              <b>Confirm the bias</b> — the panel above says <b>{bias}</b>.
+              Only take <b>{setup["type"]}</b> trades when the bias agrees.
+              If the bias changes, skip this setup.
+            </div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-num {num_cls}">2</div>
+            <div class="guide-text">
+              <b>Enter the trade</b> — place a <b>{action}</b> order at
+              <span class="guide-price">{e_p}</span>.
+              With ₹1,00,000 capital you can buy ≈ <b>{est_shares} shares</b> (95% deployed).
+            </div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-num {num_cls}">3</div>
+            <div class="guide-text">{step3_txt}</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-num {num_cls}">4</div>
+            <div class="guide-text">{step4_txt}</div>
+          </div>
+          <div class="guide-step">
+            <div class="guide-num {num_cls}">5</div>
+            <div class="guide-text">{step5_txt}</div>
+          </div>
+          <div class="guide-rule">
+            ⚠️ <b>Golden rule:</b> Never risk more than 2% of your total capital on a single trade.
+            At ₹1,00,000 that is ₹2,000 max risk per trade.
+            If the stop-loss distance implies more than that, reduce your position size accordingly.
+          </div>
+        </div>""")
+
+        # ── Support & Resistance ──────────────────────────────────────────────────────
+        with col_sr:
+            st.html('<p class="section-header">Support &amp; Resistance</p>')
+
+            if not sr_levels:
+                st.html('<p style="color:#555; font-size:0.85rem;">Enable S/R options in the sidebar.</p>')
+            else:
+                TYPE_ROW = {"resistance": "sr-res", "support": "sr-sup", "pivot": "sr-piv"}
+                TYPE_COL = {"resistance": "#f85149", "support": "#3fb950", "pivot": "#bc8cff"}
+
+                # Sort: resistances above current price (desc), then supports below (desc)
+                above = sorted([l for l in sr_levels if l["level"] > last_close],
+                               key=lambda x: x["level"])
+                below = sorted([l for l in sr_levels if l["level"] <= last_close],
+                               key=lambda x: x["level"], reverse=True)
+
+                for lv in (above + below)[:12]:
+                    dist     = (lv["level"] - last_close) / last_close * 100
+                    row_cls  = TYPE_ROW.get(lv["type"], "")
+                    col      = TYPE_COL.get(lv["type"], "#8b949e")
+                    dist_col = "#3fb950" if dist > 0 else "#f85149"
+                    st.html(f"""
+        <div class="sr-row {row_cls}">
+          <div>
+            <div class="sr-label">{lv['label']}</div>
+            <div class="sr-price">{pfx}{lv['level']:,.2f}</div>
+          </div>
+          <div style="text-align:right;">
+            <div class="sr-dist" style="color:{dist_col};">{dist:+.2f}%</div>
+            <div class="sr-label" style="color:{col}; text-transform:capitalize;">{lv['type']}</div>
+          </div>
+        </div>""")
 
 
-    with st.expander("📐  Full S/R Level Table"):
-        if sr_levels:
-            sr_rows = []
-            for lv in sorted(sr_levels, key=lambda x: x["level"], reverse=True):
-                dist = (lv["level"] - last_close) / last_close * 100
-                sr_rows.append({
-                    "Price ₹":   f"₹{lv['level']:,.2f}",
-                    "Type":       lv["type"].capitalize(),
-                    "Label":      lv["label"],
-                    "Distance":   f"{dist:+.2f}%",
-                })
-            sr_df = pd.DataFrame(sr_rows)
-            def _sr_col(val):
-                if val == "Resistance": return "color:#f85149"
-                if val == "Support":    return "color:#3fb950"
-                return "color:#bc8cff"
-            st.dataframe(sr_df.style.applymap(_sr_col, subset=["Type"]),
-                         hide_index=True, width="stretch")
-        else:
-            st.info("No S/R levels computed. Enable options in the sidebar.")
+        # ════════════════════════════════════════════════════════════════════════════
+        # SECTION 5 — DETAILS  (advanced / expandable)
+        # ════════════════════════════════════════════════════════════════════════════
+
+        st.html('<hr class="thin-divider">')
+
+        with st.expander("📊  Indicator Values  —  last bar"):
+            last     = df_enriched.iloc[-1]
+            ind_cols = [
+                ("RSI",         "rsi"),
+                ("MACD Line",   "macd_line"),
+                ("MACD Signal", "macd_signal"),
+                ("MACD Hist",   "macd_hist"),
+                ("EMA 9",       "ema_9"),
+                ("EMA 21",      "ema_21"),
+                ("EMA 50",      "ema_50"),
+                ("EMA 200",     "ema_200"),
+                ("BB Upper",    "bb_upper"),
+                ("BB Mid",      "bb_mid"),
+                ("BB Lower",    "bb_lower"),
+                ("VWAP",        "vwap"),
+                ("ATR",         "atr"),
+                ("Stoch K",      "stoch_k"),
+                ("Stoch D",      "stoch_d"),
+                ("Supertrend",   "supertrend"),
+                ("ST Direction", "st_direction"),
+                ("DC Upper",     "dc_upper"),
+                ("DC Mid",       "dc_mid"),
+                ("DC Lower",     "dc_lower"),
+            ]
+            rows = []
+            for label, col in ind_cols:
+                if col in df_enriched.columns:
+                    v = last.get(col, np.nan)
+                    rows.append({"Indicator": label,
+                                 "Value": f"{v:.4f}" if pd.notna(v) else "—"})
+
+            c1, c2 = st.columns(2)
+            half = len(rows) // 2
+            with c1:
+                st.dataframe(pd.DataFrame(rows[:half]),  hide_index=True, width="stretch")
+            with c2:
+                st.dataframe(pd.DataFrame(rows[half:]), hide_index=True, width="stretch")
+
+        with st.expander("📋  All Raw Signals  —  every indicator that fired"):
+            if signals:
+                sig_rows = []
+                for s in signals:
+                    date_str = (s["date"].strftime("%d %b %Y  %H:%M")
+                                if hasattr(s["date"], "strftime") else str(s["date"]))
+                    sig_rows.append({
+                        "Type":        s["type"],
+                        "Indicator":   s["indicator"],
+                        "Description": s["description"],
+                        "Strength":    _strength_dots(s["strength"]),
+                        "Date":        date_str,
+                    })
+                sig_df = pd.DataFrame(sig_rows)
+                def _sig_bg(val):
+                    if val == "BUY":   return "background-color:#e8f5ec; color:#1a7a3c; font-weight:bold"
+                    if val == "SELL":  return "background-color:#fdecea; color:#c0392b; font-weight:bold"
+                    return "background-color:#fff8e1; color:#b8860b; font-weight:bold"
+                st.dataframe(sig_df.style.applymap(_sig_bg, subset=["Type"]),
+                             hide_index=True, width="stretch")
+            else:
+                st.info("No signals in the current window.")
+
+        with st.expander("💰  Signal Backtest  —  simulate trades with real capital"):
+            st.caption(
+                "Simulates every signal where 3+ indicators agree. "
+                "Entry = signal-bar close · Stop = 1.5× ATR · Target = 3× ATR · "
+                "Max hold = 20 bars · Position = 95% of available capital."
+            )
+
+            bt_capital = st.number_input(
+                "Starting capital (₹)", value=100_000, step=10_000, min_value=1_000,
+                label_visibility="collapsed",
+                key="bt_cap",
+            )
+
+            if st.button("▶  Run Backtest", type="primary", key="bt_run"):
+                bt_trades, bt_final = _run_backtest(signals, df_enriched, bt_capital)
+
+                if not bt_trades:
+                    st.info("No qualifying signals found in this window to backtest.")
+                else:
+                    total_pnl  = bt_final - bt_capital
+                    wins       = sum(1 for t in bt_trades if t["P&L"] > 0)
+                    losses     = len(bt_trades) - wins
+                    win_rate   = wins / len(bt_trades) * 100
+                    avg_win    = np.mean([t["P&L"] for t in bt_trades if t["P&L"] > 0] or [0])
+                    avg_loss   = np.mean([t["P&L"] for t in bt_trades if t["P&L"] <= 0] or [0])
+                    pnl_color  = "normal" if total_pnl >= 0 else "inverse"
+
+                    # ── Summary metrics ────────────────────────────────────────────
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Final Capital",  f"{pfx}{bt_final:,.0f}",
+                              f"{total_pnl:+,.0f} ({total_pnl/bt_capital*100:+.1f}%)")
+                    m2.metric("Total Trades",   len(bt_trades))
+                    m3.metric("Win Rate",       f"{win_rate:.0f}%",
+                              f"{wins}W  {losses}L")
+                    m4.metric("Avg Win",        f"{pfx}{avg_win:+,.0f}")
+                    m5.metric("Avg Loss",       f"{pfx}{avg_loss:+,.0f}")
+
+                    # ── Equity curve ───────────────────────────────────────────────
+                    equity = [bt_capital] + [t["Capital After"] for t in bt_trades]
+                    eq_df  = pd.DataFrame({
+                        "Trade": range(len(equity)),
+                        "Capital": equity,
+                    })
+                    eq_fig = go.Figure(go.Scatter(
+                        x=eq_df["Trade"], y=eq_df["Capital"],
+                        mode="lines+markers",
+                        line=dict(color="#1a5aad", width=2),
+                        marker=dict(size=6),
+                        fill="tozeroy",
+                        fillcolor="rgba(26,90,173,0.07)",
+                    ))
+                    eq_fig.update_layout(
+                        height=220,
+                        margin=dict(l=10, r=10, t=10, b=30),
+                        paper_bgcolor="#fff", plot_bgcolor="#fafafa",
+                        xaxis=dict(title="Trade #", showgrid=True, gridcolor="#e8e8e8"),
+                        yaxis=dict(title="Capital ₹", showgrid=True, gridcolor="#e8e8e8"),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(eq_fig, width="stretch",
+                                    config={"displayModeBar": False})
+
+                    # ── Trade log table ────────────────────────────────────────────
+                    bt_df = pd.DataFrame(bt_trades)
+
+                    def _bt_row_style(row):
+                        color = "#e8f5ec" if row["P&L"] > 0 else "#fdecea"
+                        return [f"background-color:{color}"] * len(row)
+
+                    def _result_style(val):
+                        if val in ("Target Hit", "Trail Stop"): return "color:#1a7a3c; font-weight:600"
+                        if val == "Stop Loss":                  return "color:#c0392b; font-weight:600"
+                        return "color:#888"
+
+                    styled = (
+                        bt_df.style
+                        .apply(_bt_row_style, axis=1)
+                        .applymap(_result_style, subset=["Result"])
+                    )
+                    st.dataframe(styled, hide_index=True, width="stretch")
+
+                    # ── Download button ────────────────────────────────────────────
+                    ticker_label = stock.get("label", stock.get("ticker", "backtest"))
+                    csv_buf = bt_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="⬇  Download Backtest as CSV",
+                        data=csv_buf,
+                        file_name=f"backtest_{ticker_label}_{pd.Timestamp.today().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        help="Download all trades with invested amount, current amount and P&L",
+                    )
+
+
+        with st.expander("📐  Full S/R Level Table"):
+            if sr_levels:
+                sr_rows = []
+                for lv in sorted(sr_levels, key=lambda x: x["level"], reverse=True):
+                    dist = (lv["level"] - last_close) / last_close * 100
+                    sr_rows.append({
+                        "Price ₹":   f"₹{lv['level']:,.2f}",
+                        "Type":       lv["type"].capitalize(),
+                        "Label":      lv["label"],
+                        "Distance":   f"{dist:+.2f}%",
+                    })
+                sr_df = pd.DataFrame(sr_rows)
+                def _sr_col(val):
+                    if val == "Resistance": return "color:#f85149"
+                    if val == "Support":    return "color:#3fb950"
+                    return "color:#bc8cff"
+                st.dataframe(sr_df.style.applymap(_sr_col, subset=["Type"]),
+                             hide_index=True, width="stretch")
+            else:
+                st.info("No S/R levels computed. Enable options in the sidebar.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 2 — TRADE OPPORTUNITIES SCANNER
 # ════════════════════════════════════════════════════════════════════════════
 
-with tab_scan:
+if _page == "scan":
     st.markdown("### 🎯 Trade Opportunities")
 
     # ════════════════════════════════════════════════════════════════════════
@@ -3729,7 +3811,7 @@ with tab_scan:
 # TAB 3 — MARKET SENTIMENT
 # ════════════════════════════════════════════════════════════════════════════
 
-with tab_sentiment:
+if _page == "sentiment":
     st.markdown("### 🌡️ Market Sentiment")
     st.caption("Live overview of Indian market conditions — indices, VIX, sector breadth, and FII/DII flows.")
 
@@ -3936,7 +4018,7 @@ with tab_sentiment:
 # TAB 5 — PULLBACK SCANNER
 # ════════════════════════════════════════════════════════════════════════════
 
-with tab_pullback:
+if _page == "pullback":
     st.markdown("### 🔁 Pullback Scanner")
     st.caption(
         "Finds NSE/BSE stocks in confirmed uptrends that have pulled back into a buy zone. "
@@ -4134,7 +4216,7 @@ Too shallow (<3%) may just be noise. Too deep (>20%) risks a trend break.
 # TAB 6 — SME STOCKS (NSE Emerge)
 # ════════════════════════════════════════════════════════════════════════════
 
-with tab_sme:
+if _page == "sme":
     st.markdown("### 🏭 SME Stocks — NSE Emerge")
     st.caption(
         "Scans NSE Emerge (SME) listed stocks for trade setups. "
