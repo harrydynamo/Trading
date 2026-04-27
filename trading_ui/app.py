@@ -1005,22 +1005,46 @@ def scan_sme_stocks() -> pd.DataFrame:
     if not universe:
         return pd.DataFrame()
 
-    # Build OHLCV from bhavcopy
-    ohlcv_map = _build_sme_ohlcv(n_days=60)
-    if not ohlcv_map:
-        return pd.DataFrame()
+    # Build OHLCV from bhavcopy (last 90 days for wider coverage)
+    ohlcv_map = _build_sme_ohlcv(n_days=90)
 
-    # Map bhavcopy symbols → universe metadata
-    # universe keys are NSE symbols (upper-case), bhavcopy symbols match
+    # Map universe symbols (upper-case) → metadata
     sym_to_meta: dict[str, dict] = {}
     for key, meta in universe.items():
-        sym = meta["symbol"].upper()
-        sym_to_meta[sym] = meta
+        sym_to_meta[meta["symbol"].upper()] = meta
+
+    # All symbols to process = universe ∪ bhavcopy (bhavcopy may have stocks
+    # not yet in the cached universe, universe may have illiquid stocks not in bhavcopy)
+    all_syms = set(sym_to_meta.keys()) | set(ohlcv_map.keys())
 
     rows = []
-    for sym, df in ohlcv_map.items():
+    for sym in all_syms:
+        df_raw = ohlcv_map.get(sym)
+
+        # ── No bhavcopy data → show as "No Recent Trading" ──────────────────
+        if df_raw is None or df_raw.empty:
+            s_meta = sym_to_meta.get(sym, {})
+            rows.append({
+                "Symbol":     sym,
+                "Name":       s_meta.get("name", sym),
+                "Signal":     "NO DATA",
+                "Score":      0,
+                "Price (₹)":  None,
+                "Day Chg %":  None,
+                "Days":       0,
+                "ADX":        None,
+                "RSI":        None,
+                "Vol Ratio":  None,
+                "Avg Vol":    0,
+                "Liquidity":  "⚫ No Data",
+                "Stop (₹)":   None,
+                "Target (₹)": None,
+                "ATR":        None,
+            })
+            continue
+
         try:
-            df = df.copy()
+            df = df_raw.copy()
             df.dropna(subset=["Close"], inplace=True)
             if len(df) < 2:     # need at least 2 rows for any calculation
                 continue
