@@ -111,11 +111,33 @@ header button,
     visibility: visible !important;
     display:    flex   !important;
 }
-.stApp    { background-color: #f7f8fa; }
+.stApp    { background-color: #131722; }
+body      { background-color: #131722 !important; }
 .block-container {
     padding-top: 1rem !important;
     padding-bottom: 1rem !important;
     max-width: 100% !important;
+    background-color: #131722 !important;
+    color: #d1d4dc !important;
+}
+/* Dark text for all streamlit elements */
+p, span, label, div, h1, h2, h3, h4 {
+    color: #d1d4dc !important;
+}
+/* Dark cards */
+[data-testid="stMetric"] {
+    background: #1e2535 !important;
+    border-radius: 8px !important;
+    padding: 8px 14px !important;
+    border: 1px solid #2a2e39 !important;
+}
+/* Dark dataframes */
+[data-testid="stDataFrame"] { background: #1e2535 !important; }
+/* Dark expanders */
+[data-testid="stExpander"] { background: #1e2535 !important; border-color: #2a2e39 !important; }
+/* Dark selectbox / inputs */
+[data-testid="stSelectbox"] > div, [data-testid="stTextInput"] > div {
+    background: #1e2535 !important; border-color: #2a2e39 !important;
 }
 
 /* ── Sidebar nav styling ── */
@@ -432,11 +454,13 @@ def _atm_strikes(spot: float, step: int, n_each_side: int = 10) -> list[int]:
 # ─── Timeframe config ─────────────────────────────────────────────────────────
 
 TIMEFRAMES = {
-    "5m":  {"interval": "5m",  "period": "5d",  "max_bars": 390},
-    "15m": {"interval": "15m", "period": "60d", "max_bars": 390},
-    "1h":  {"interval": "60m", "period": "60d", "max_bars": 500},
-    "1D":  {"interval": "1d",  "period": "2y",  "max_bars": 504},
-    "1W":  {"interval": "1wk", "period": "10y", "max_bars": 520},
+    "5m":  {"interval": "5m",  "period": "5d",   "max_bars": 390},
+    "15m": {"interval": "15m", "period": "60d",  "max_bars": 390},
+    "1h":  {"interval": "60m", "period": "60d",  "max_bars": 500},
+    "1D":  {"interval": "1d",  "period": "2y",   "max_bars": 504},
+    "1W":  {"interval": "1wk", "period": "10y",  "max_bars": 520},
+    "1M":  {"interval": "1mo", "period": "max",  "max_bars": 360},
+    "3M":  {"interval": "3mo", "period": "max",  "max_bars": 120},
 }
 
 
