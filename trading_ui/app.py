@@ -111,33 +111,11 @@ header button,
     visibility: visible !important;
     display:    flex   !important;
 }
-.stApp    { background-color: #131722; }
-body      { background-color: #131722 !important; }
+.stApp    { background-color: #ffffff; }
 .block-container {
     padding-top: 1rem !important;
     padding-bottom: 1rem !important;
     max-width: 100% !important;
-    background-color: #131722 !important;
-    color: #d1d4dc !important;
-}
-/* Dark text for all streamlit elements */
-p, span, label, div, h1, h2, h3, h4 {
-    color: #d1d4dc !important;
-}
-/* Dark cards */
-[data-testid="stMetric"] {
-    background: #1e2535 !important;
-    border-radius: 8px !important;
-    padding: 8px 14px !important;
-    border: 1px solid #2a2e39 !important;
-}
-/* Dark dataframes */
-[data-testid="stDataFrame"] { background: #1e2535 !important; }
-/* Dark expanders */
-[data-testid="stExpander"] { background: #1e2535 !important; border-color: #2a2e39 !important; }
-/* Dark selectbox / inputs */
-[data-testid="stSelectbox"] > div, [data-testid="stTextInput"] > div {
-    background: #1e2535 !important; border-color: #2a2e39 !important;
 }
 
 /* ── Sidebar nav styling ── */
